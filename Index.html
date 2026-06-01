@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <?!= include('Styles'); ?>
+</head>
+<body>
+  <div id="app" class="app">
+    <aside class="sidebar">
+      <div class="brand">📡 NAP Converter</div>
+      <nav id="nav"></nav>
+      <div class="me" id="me"></div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <h1 id="pageTitle">Converter</h1>
+        <div class="topbar-right" id="topbarRight"></div>
+      </header>
+
+      <section id="view" class="view"></section>
+    </main>
+  </div>
+
+  <template id="tpl-converter">
+    <div class="card">
+      <div class="row">
+        <label class="field">
+          <span>Snapshot date</span>
+          <input type="date" id="snapDate">
+        </label>
+        <label class="drop" id="drop">
+          <span id="dropText">Click to choose your NAP CSV</span>
+          <input type="file" id="file" accept=".csv,text/csv">
+        </label>
+      </div>
+      <button id="go" class="primary" disabled>🚀 Convert &amp; Save</button>
+      <div class="status" id="status"></div>
+    </div>
+
+    <div class="tabs" id="resultTabs" hidden>
+      <div class="tab-row">
+        <button class="tab active" data-tab="summary">📊 Summary</button>
+        <button class="tab" data-tab="preview">👀 Preview</button>
+        <button class="tab" data-tab="missing">⚠️ Missing Location <span id="missCount" class="badge">0</span></button>
+      </div>
+      <div class="tab-pane active" data-pane="summary" id="paneSummary"></div>
+      <div class="tab-pane" data-pane="preview" id="panePreview"></div>
+      <div class="tab-pane" data-pane="missing" id="paneMissing"></div>
+    </div>
+  </template>
+
+  <template id="tpl-history">
+    <div class="card">
+      <h2>Data history</h2>
+      <p class="sub">Every saved snapshot. Click <em>Excel</em> to rebuild and download.</p>
+      <div id="histList" class="list"></div>
+    </div>
+  </template>
+
+  <template id="tpl-geo">
+    <div class="tabs">
+      <div class="tab-row">
+        <button class="tab active" data-tab="edit">➕ Add / Edit</button>
+        <button class="tab" data-tab="bulk">📤 Bulk Upload</button>
+        <button class="tab" data-tab="view">📋 View All</button>
+      </div>
+
+      <div class="tab-pane active" data-pane="edit">
+        <div class="card">
+          <div class="grid2">
+            <label class="field"><span>NAP ID</span><input id="geoNap"></label>
+            <label class="field"><span>City</span><input id="geoCity"></label>
+            <label class="field"><span>Barangay</span><input id="geoBrgy"></label>
+            <label class="field"><span>Location tagging</span><input id="geoLoc"></label>
+          </div>
+          <div class="actions">
+            <button class="primary" id="geoSave">💾 Save</button>
+            <button class="ghost" id="geoLoad">🔎 Load existing</button>
+            <button class="ghost" id="geoClear">Cancel</button>
+            <button class="danger" id="geoDel">🗑️ Delete</button>
+          </div>
+          <div class="status" id="geoStatus"></div>
+        </div>
+      </div>
+
+      <div class="tab-pane" data-pane="bulk">
+        <div class="card">
+          <p class="sub">Excel must have columns: <code>NAP ID, CITY_NAME, BRGY_NAME, LOCATION TAGGING</code>.</p>
+          <label class="drop">
+            <span id="bulkText">Click to choose your Excel file</span>
+            <input type="file" id="bulkFile" accept=".xlsx">
+          </label>
+          <button class="primary" id="bulkGo" disabled>Upload</button>
+          <div class="status" id="bulkStatus"></div>
+        </div>
+      </div>
+
+      <div class="tab-pane" data-pane="view">
+        <div class="card">
+          <input id="geoSearch" placeholder="Search by NAP ID, city, barangay..." class="search">
+          <div id="geoList" class="list"></div>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-admins">
+    <div class="card">
+      <h2>Admin management</h2>
+      <p class="sub">Sign-in is via Google Workspace. This list controls who sees the admin-only pages (GEO Reference, Admin Management).</p>
+      <div class="row">
+        <input id="adminEmail" placeholder="user@company.com" class="search">
+        <button class="primary" id="adminAdd">Add admin</button>
+      </div>
+      <div id="adminList" class="list"></div>
+      <div class="status" id="adminStatus"></div>
+    </div>
+  </template>
+
+  <template id="tpl-about">
+    <div class="card">
+      <h2>About this app</h2>
+      <p>NAP Data Converter — Google Apps Script port of the original Streamlit tool. Built so the workflow lives entirely inside Google Workspace (Sites + Apps Script + Sheets + Drive).</p>
+      <h3>Output columns</h3>
+      <ol class="cols"></ol>
+      <h3>Lookup spreadsheet tabs</h3>
+      <ul>
+        <li><code>ADMINS</code> — who sees admin pages</li>
+        <li><code>MASTER</code> — optional NAP-ID override layer</li>
+        <li><code>PLA_BY_CABINET</code> — PLA ID + Tech by cabinet</li>
+        <li><code>AREA_BY_PREFIX</code> — Sales Area / Province / Territory by NAP-ID prefix</li>
+        <li><code>GEO_REFERENCE</code> — City / Barangay / Location Tagging by NAP ID</li>
+        <li><code>NAP_DATA</code> — saved daily snapshots</li>
+        <li><code>SNAPSHOT_INDEX</code> — index of snapshots for the History page</li>
+      </ul>
+      <h3>Known limits</h3>
+      <ul>
+        <li>Apps Script hard cap: <strong>6 minutes</strong> per execution. Very large CSVs may not finish.</li>
+        <li>Google Sheets cap: <strong>10M cells per spreadsheet</strong>. At ~25k rows × 19 cols, NAP_DATA fills up in roughly 20 daily snapshots — rotate or archive monthly.</li>
+        <li>Login is the Google account viewing the page. No bcrypt logins.</li>
+      </ul>
+    </div>
+  </template>
+
+  <?!= include('Scripts'); ?>
+</body>
+</html>

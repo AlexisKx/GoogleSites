@@ -1,0 +1,358 @@
+<script>
+  /* eslint-disable */
+  const PAGES = [
+    { id: 'converter', label: '📡 Converter', admin: false },
+    { id: 'history',   label: '🕓 Data History', admin: false },
+    { id: 'geo',       label: '📁 GEO Reference', admin: true },
+    { id: 'admins',    label: '👥 Admin Management', admin: true },
+    { id: 'about',     label: 'ℹ️ About', admin: false }
+  ];
+
+  let session = { email: '', isAdmin: false };
+  let lastResult = null;
+  let bulkPayload = null;
+
+  function call(fn, ...args) {
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(err => reject(err))
+        [fn](...args);
+    });
+  }
+
+  function $(sel, root) { return (root || document).querySelector(sel); }
+  function $$(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+  function fmtNum(n) { return Number(n || 0).toLocaleString(); }
+
+  function setPage(id) {
+    location.hash = id;
+    renderNav();
+    render(id);
+  }
+
+  function renderNav() {
+    const nav = $('#nav');
+    nav.innerHTML = '';
+    const current = (location.hash || '#converter').slice(1);
+    PAGES.forEach(p => {
+      if (p.admin && !session.isAdmin) return;
+      const a = document.createElement('a');
+      a.textContent = p.label;
+      a.className = (p.id === current ? 'active' : '');
+      a.onclick = () => setPage(p.id);
+      nav.appendChild(a);
+    });
+    $('#me').innerHTML = session.email
+      ? `<strong>${esc(session.email)}</strong>${session.isAdmin ? 'Admin' : 'User'}`
+      : `<em>Not signed in</em>`;
+  }
+
+  function render(id) {
+    const page = PAGES.find(p => p.id === id) || PAGES[0];
+    if (page.admin && !session.isAdmin) {
+      $('#pageTitle').textContent = 'Access denied';
+      $('#view').innerHTML = `<div class="card"><p class="err">This page requires admin access.</p></div>`;
+      return;
+    }
+    $('#pageTitle').textContent = page.label.replace(/^[^ ]+ /, '');
+    const tpl = $('#tpl-' + id);
+    $('#view').innerHTML = '';
+    $('#view').appendChild(tpl.content.cloneNode(true));
+    ({ converter: initConverter, history: initHistory, geo: initGeo,
+       admins: initAdmins, about: initAbout })[id]();
+  }
+
+  // -------------------- CONVERTER --------------------
+  function initConverter() {
+    const today = new Date().toISOString().slice(0, 10);
+    $('#snapDate').value = today;
+    let csvText = null;
+
+    $('#file').addEventListener('change', e => {
+      const f = e.target.files[0];
+      if (!f) return;
+      $('#dropText').textContent = `📄 ${f.name}  (${(f.size / 1048576).toFixed(2)} MB)`;
+      const r = new FileReader();
+      r.onload = ev => { csvText = ev.target.result; $('#go').disabled = false; };
+      r.readAsText(f);
+    });
+
+    $('#go').addEventListener('click', async () => {
+      if (!csvText) return;
+      $('#go').disabled = true;
+      $('#status').innerHTML = '⏳ Processing… large files can take a while.';
+      try {
+        const res = await call('processNapCsv', csvText, $('#snapDate').value);
+        lastResult = res;
+        $('#status').innerHTML = '';
+        $('#resultTabs').hidden = false;
+        renderSummary(res);
+        renderPreview(res);
+        renderMissing(res);
+        $('#missCount').textContent = res.missing.length;
+        bindTabs($('#resultTabs'));
+      } catch (err) {
+        $('#status').innerHTML = `<div class="err">❌ ${esc(err.message || err)}</div>`;
+      } finally {
+        $('#go').disabled = false;
+      }
+    });
+  }
+
+  function renderSummary(res) {
+    $('#paneSummary').innerHTML = `
+      <div class="summary-stats">
+        <div class="stat"><div class="num">${fmtNum(res.read)}</div><div class="lbl">Rows read</div></div>
+        <div class="stat"><div class="num">${fmtNum(res.written)}</div><div class="lbl">Rows written</div></div>
+        <div class="stat"><div class="num">${fmtNum(res.skipped)}</div><div class="lbl">Rows skipped</div></div>
+      </div>
+      <div class="ok">✅ Saved snapshot ${esc(res.snapshotDate)}</div>
+      <a class="dl" href="${esc(res.downloadUrl)}" target="_blank">⬇️ Download Excel</a>
+      <div class="meta">Also saved in Drive under "NAP Converter Output".</div>`;
+  }
+
+  function renderPreview(res) {
+    if (!res.preview.length) { $('#panePreview').innerHTML = '<p class="sub">No rows.</p>'; return; }
+    const cols = Object.keys(res.preview[0]);
+    const head = cols.map(c => `<th>${esc(c)}</th>`).join('');
+    const body = res.preview.map(r =>
+      '<tr>' + cols.map(c => `<td>${esc(r[c])}</td>`).join('') + '</tr>').join('');
+    $('#panePreview').innerHTML = `<div class="scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+  }
+
+  function renderMissing(res) {
+    const m = res.missing;
+    if (!m.length) {
+      $('#paneMissing').innerHTML = '<p class="ok">No missing-location records. 🎉</p>';
+      return;
+    }
+    const rows = m.map(r => `<tr>
+        <td>${esc(r.napId)}</td>
+        <td>${r.city ? '✅ ' + esc(r.city) : '❌'}</td>
+        <td>${r.brgy ? '✅ ' + esc(r.brgy) : '❌'}</td>
+        <td>${r.location ? '✅ ' + esc(r.location) : '❌'}</td>
+      </tr>`).join('');
+    $('#paneMissing').innerHTML = `
+      <div class="warn">⚠️ ${fmtNum(m.length)} record(s) missing City / Barangay / Location Tagging.</div>
+      <button class="primary" id="dlMissing" style="margin:10px 0">⬇️ Download Missing as Excel</button>
+      <div id="missingStatus" class="status"></div>
+      <div class="scroll"><table><thead><tr><th>NAP ID</th><th>City</th><th>Barangay</th><th>Location Tagging</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    $('#dlMissing').onclick = async () => {
+      $('#dlMissing').disabled = true;
+      $('#missingStatus').innerHTML = '⏳ Building Excel…';
+      try {
+        const r = await call('buildMissingXlsx', m);
+        $('#missingStatus').innerHTML =
+          `<a class="dl" href="${esc(r.downloadUrl)}" target="_blank">⬇️ Open / download Excel</a>`;
+      } catch (err) {
+        $('#missingStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
+      } finally {
+        $('#dlMissing').disabled = false;
+      }
+    };
+  }
+
+  function bindTabs(root) {
+    $$('.tab', root).forEach(t => {
+      t.onclick = () => {
+        $$('.tab', root).forEach(x => x.classList.remove('active'));
+        $$('.tab-pane', root).forEach(x => x.classList.remove('active'));
+        t.classList.add('active');
+        $(`.tab-pane[data-pane="${t.dataset.tab}"]`, root).classList.add('active');
+      };
+    });
+  }
+
+  // -------------------- HISTORY --------------------
+  async function initHistory() {
+    $('#histList').innerHTML = '<p class="sub">Loading…</p>';
+    try {
+      const list = await call('listSnapshots');
+      if (!list.length) { $('#histList').innerHTML = '<p class="sub">No saved snapshots yet.</p>'; return; }
+      $('#histList').innerHTML = list.map(s => `
+        <div class="item">
+          <div>
+            <strong>${esc(s.snapshotDate)}</strong>
+            <div class="meta">${fmtNum(s.rowCount)} rows · uploaded by ${esc(s.uploadedBy)}</div>
+          </div>
+          <button class="primary" data-date="${esc(s.snapshotDate)}">Excel</button>
+        </div>`).join('');
+      $$('#histList button').forEach(b => {
+        b.onclick = async () => {
+          const orig = b.textContent;
+          b.disabled = true; b.textContent = 'Building…';
+          try {
+            const r = await call('exportSnapshot', b.dataset.date);
+            b.outerHTML = `<a class="dl" href="${esc(r.downloadUrl)}" target="_blank">⬇️ Download</a>`;
+          } catch (err) {
+            b.textContent = orig; b.disabled = false;
+            alert(err.message || err);
+          }
+        };
+      });
+    } catch (err) {
+      $('#histList').innerHTML = `<p class="err">${esc(err.message || err)}</p>`;
+    }
+  }
+
+  // -------------------- GEO --------------------
+  function initGeo() {
+    bindTabs($('#view .tabs'));
+
+    $('#geoSave').onclick = async () => {
+      const entry = {
+        napId: $('#geoNap').value, city: $('#geoCity').value,
+        brgy: $('#geoBrgy').value, location: $('#geoLoc').value
+      };
+      try {
+        const r = await call('upsertGeo', entry);
+        $('#geoStatus').innerHTML = `<div class="ok">✅ ${esc(r.action)} ${esc(r.napId)}</div>`;
+      } catch (err) {
+        $('#geoStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
+      }
+    };
+    $('#geoLoad').onclick = async () => {
+      const napId = $('#geoNap').value.trim();
+      if (!napId) return;
+      try {
+        const r = await call('getGeo', napId);
+        if (!r) { $('#geoStatus').innerHTML = '<div class="warn">Not found.</div>'; return; }
+        $('#geoCity').value = r.city; $('#geoBrgy').value = r.brgy; $('#geoLoc').value = r.location;
+        $('#geoStatus').innerHTML = '<div class="ok">Loaded.</div>';
+      } catch (err) {
+        $('#geoStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
+      }
+    };
+    $('#geoClear').onclick = () => {
+      ['#geoNap', '#geoCity', '#geoBrgy', '#geoLoc'].forEach(s => $(s).value = '');
+      $('#geoStatus').innerHTML = '';
+    };
+    $('#geoDel').onclick = async () => {
+      const napId = $('#geoNap').value.trim();
+      if (!napId) return;
+      if (!confirm(`Delete GEO entry for ${napId}?`)) return;
+      if (!confirm('This cannot be undone. Really delete?')) return;
+      try {
+        const r = await call('deleteGeo', napId);
+        $('#geoStatus').innerHTML = r.deleted
+          ? `<div class="ok">🗑️ Deleted.</div>` : '<div class="warn">Not found.</div>';
+      } catch (err) {
+        $('#geoStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
+      }
+    };
+
+    $('#bulkFile').addEventListener('change', e => {
+      const f = e.target.files[0];
+      if (!f) return;
+      $('#bulkText').textContent = `📄 ${f.name}`;
+      const r = new FileReader();
+      r.onload = ev => {
+        const b64 = ev.target.result.split(',')[1];
+        bulkPayload = { b64: b64, type: f.type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
+        $('#bulkGo').disabled = false;
+      };
+      r.readAsDataURL(f);
+    });
+    $('#bulkGo').onclick = async () => {
+      if (!bulkPayload) return;
+      $('#bulkGo').disabled = true;
+      $('#bulkStatus').innerHTML = '⏳ Uploading…';
+      try {
+        const r = await call('bulkUpsertGeo', bulkPayload.b64, bulkPayload.type);
+        $('#bulkStatus').innerHTML = `<div class="ok">✅ ${fmtNum(r.processed)} processed — ${fmtNum(r.added)} added, ${fmtNum(r.updated)} updated.</div>`;
+      } catch (err) {
+        $('#bulkStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
+      } finally {
+        $('#bulkGo').disabled = false;
+      }
+    };
+
+    $('#geoSearch').addEventListener('input', debounce(refreshGeoList, 200));
+    refreshGeoList();
+  }
+
+  async function refreshGeoList() {
+    try {
+      const list = await call('listGeo', $('#geoSearch').value);
+      if (!list.length) { $('#geoList').innerHTML = '<p class="sub">No entries.</p>'; return; }
+      $('#geoList').innerHTML = `<div class="scroll"><table><thead><tr>
+        <th>NAP ID</th><th>City</th><th>Barangay</th><th>Location Tagging</th><th>Updated</th></tr></thead><tbody>
+        ${list.map(r => `<tr>
+          <td>${esc(r.napId)}</td><td>${esc(r.city)}</td>
+          <td>${esc(r.brgy)}</td><td>${esc(r.location)}</td>
+          <td class="meta">${esc((r.updatedAt || '').slice(0, 10))} ${esc(r.updatedBy)}</td>
+        </tr>`).join('')}</tbody></table></div>`;
+    } catch (err) {
+      $('#geoList').innerHTML = `<p class="err">${esc(err.message || err)}</p>`;
+    }
+  }
+
+  function debounce(fn, ms) {
+    let t; return function () { clearTimeout(t); t = setTimeout(() => fn.apply(this, arguments), ms); };
+  }
+
+  // -------------------- ADMINS --------------------
+  function initAdmins() {
+    $('#adminAdd').onclick = async () => {
+      const email = $('#adminEmail').value.trim();
+      if (!email) return;
+      try {
+        const r = await call('addAdmin', email);
+        $('#adminStatus').innerHTML = `<div class="ok">${esc(r.action)} ${esc(r.email)}</div>`;
+        $('#adminEmail').value = '';
+        refreshAdmins();
+      } catch (err) {
+        $('#adminStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
+      }
+    };
+    refreshAdmins();
+  }
+
+  async function refreshAdmins() {
+    try {
+      const list = await call('listAdmins');
+      $('#adminList').innerHTML = list.length
+        ? list.map(a => `<div class="item">
+            <div><strong>${esc(a.email)}</strong>
+            <div class="meta">added ${esc((a.addedAt || '').slice(0, 10))} by ${esc(a.addedBy)}</div></div>
+            <button class="danger" data-email="${esc(a.email)}">Remove</button>
+          </div>`).join('')
+        : '<p class="sub">No admins. Add one in the ADMINS tab of the lookup sheet directly to bootstrap.</p>';
+      $$('#adminList button').forEach(b => {
+        b.onclick = async () => {
+          if (!confirm(`Remove admin ${b.dataset.email}?`)) return;
+          try {
+            await call('removeAdmin', b.dataset.email);
+            refreshAdmins();
+          } catch (err) { alert(err.message || err); }
+        };
+      });
+    } catch (err) {
+      $('#adminList').innerHTML = `<p class="err">${esc(err.message || err)}</p>`;
+    }
+  }
+
+  // -------------------- ABOUT --------------------
+  function initAbout() {
+    const cols = ['Cabinet','NAP ID','Discovered When','PLA ID','Tech','Ports Assigned','Ports Reserved',
+      'Ports Total','UTILIZATION','Latitude','Longitude','SALES_AREA','TERRITORY','BRGY_NAME','CITY_NAME',
+      'PROVINCE_NAME','LOCATION TAGGING'];
+    $('#view .cols').innerHTML = cols.map(c => `<li>${esc(c)}</li>`).join('');
+  }
+
+  // -------------------- BOOT --------------------
+  (async function boot() {
+    try {
+      session = await call('getSession');
+    } catch (e) {
+      session = { email: '', isAdmin: false };
+    }
+    const initial = (location.hash || '#converter').slice(1);
+    const allowed = PAGES.find(p => p.id === initial && (!p.admin || session.isAdmin));
+    setPage(allowed ? initial : 'converter');
+    window.addEventListener('hashchange', () => render((location.hash || '#converter').slice(1)));
+  })();
+</script>
