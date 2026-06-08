@@ -6,6 +6,8 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <?!= include('LookupsClient'); ?>
   <?!= include('Styles'); ?>
 </head>
 <body>
@@ -39,17 +41,23 @@
     <div class="card">
       <div class="row">
         <label class="field">
-          <span>Snapshot date</span>
+          <span>Report date</span>
           <input type="date" id="snapDate">
         </label>
         <label class="drop" id="drop">
-          <span id="dropText">📂 Click to choose your NAP CSV</span>
+          <span id="dropText">📂 Click to choose your NAP CSV (up to ~700 MB)</span>
           <input type="file" id="file" accept=".csv,text/csv">
         </label>
       </div>
       <div class="actions">
-        <button id="go" class="primary" disabled>🚀 Convert &amp; Save</button>
+        <button id="go" class="primary" disabled>🚀 Convert &amp; Download</button>
       </div>
+
+      <div class="progress-wrap" id="progressWrap" hidden>
+        <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+        <div class="progress-text" id="progressText">Starting…</div>
+      </div>
+
       <div class="status" id="status"></div>
     </div>
 
@@ -62,14 +70,6 @@
       <div class="tab-pane active" data-pane="summary" id="paneSummary"></div>
       <div class="tab-pane" data-pane="preview" id="panePreview"></div>
       <div class="tab-pane" data-pane="missing" id="paneMissing"></div>
-    </div>
-  </template>
-
-  <template id="tpl-history">
-    <div class="card">
-      <h2>Saved snapshots</h2>
-      <p class="sub">Every conversion you save shows up here. Click <em>Excel</em> to rebuild and download any past day.</p>
-      <div id="histList" class="list"></div>
     </div>
   </template>
 
@@ -104,10 +104,10 @@
       <div class="tab-pane" data-pane="bulk">
         <div class="card">
           <h2>Bulk upload</h2>
-          <p class="sub">Excel must have columns: <code>NAP ID</code>, <code>CITY_NAME</code>, <code>BRGY_NAME</code>, <code>LOCATION TAGGING</code>. Existing NAP IDs are updated, new ones are added.</p>
+          <p class="sub">Excel must have columns: <code>NAP ID</code>, <code>CITY_NAME</code>, <code>BRGY_NAME</code>, <code>LOCATION TAGGING</code>. Existing entries are updated, new ones are added.</p>
           <label class="drop">
             <span id="bulkText">📄 Click to choose your Excel file</span>
-            <input type="file" id="bulkFile" accept=".xlsx">
+            <input type="file" id="bulkFile" accept=".xlsx,.xls">
           </label>
           <div class="actions">
             <button class="primary" id="bulkGo" disabled>Upload</button>
@@ -142,22 +142,20 @@
   <template id="tpl-about">
     <div class="card">
       <h2>About this app</h2>
-      <p class="sub">Google Apps Script port of the original Streamlit tool. Built to live entirely inside Google Workspace (Sites + Apps Script + Sheets + Drive).</p>
+      <p class="sub">Google Apps Script port of the Streamlit NAP Converter. All file processing now happens <strong>in your browser</strong>, so it handles 100–700 MB files without hitting Apps Script's 6-minute or 50 MB limits.</p>
       <h3>Output columns</h3>
       <ol class="cols"></ol>
-      <h3>Lookup spreadsheet tabs</h3>
+      <h3>How it works</h3>
       <ul>
-        <li><code>ADMINS</code> — controls who sees admin pages</li>
-        <li><code>GEO_REFERENCE</code> — City / Barangay / Location Tagging by NAP ID</li>
-        <li><code>NAP_DATA</code> — saved daily snapshots</li>
-        <li><code>SNAPSHOT_INDEX</code> — index of snapshots for the History page</li>
+        <li><strong>Browser</strong> streams the CSV, parses + merges + enriches, builds the Excel, triggers download.</li>
+        <li><strong>Apps Script</strong> only stores the GEO_REFERENCE (City / Barangay / Location Tagging by NAP ID) and the admin allowlist.</li>
+        <li>PLA ID, Tech, Sales Area, Province, Territory are derived from the same dictionaries the Python script uses (bundled into the page).</li>
       </ul>
-      <p class="sub">PLA ID, Tech, Sales Area, Province, and Territory are derived from the NAP ID / Cabinet using the same dictionaries as the Python script. Update <code>Lookups.gs</code> in the Apps Script editor when a new cabinet or prefix appears.</p>
-      <h3>Known limits</h3>
+      <h3>Notes</h3>
       <ul>
-        <li>Apps Script cap: <strong>6 minutes</strong> per execution. Very large CSVs may not finish.</li>
-        <li>Google Sheets cap: <strong>10M cells per spreadsheet</strong>. NAP_DATA fills up in ~20 daily snapshots — rotate or archive monthly.</li>
-        <li>Login is the Google account viewing the page. No bcrypt logins.</li>
+        <li>Output XLSX size scales with row count. For 700 MB CSV the resulting Excel can be 50–200 MB — make sure you have RAM.</li>
+        <li>The browser tab will say "loading" for a while during big conversions. That's normal — don't close it. A progress bar shows live status.</li>
+        <li>Conversions are <strong>not saved</strong> anywhere. Re-run if you need the file again.</li>
       </ul>
     </div>
   </template>

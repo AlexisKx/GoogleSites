@@ -1,16 +1,23 @@
 <script>
   /* eslint-disable */
+
+  // ============================================================
+  // Pages
+  // ============================================================
   const PAGES = [
-    { id: 'converter', label: '📡 Converter',       admin: false, title: 'Converter',         desc: 'Upload a NAP CSV, get a cleaned Excel back, and save a dated snapshot.' },
-    { id: 'history',   label: '🕓 Data History',    admin: false, title: 'Data history',      desc: 'Every saved snapshot is here. Rebuild the Excel for any day.' },
-    { id: 'geo',       label: '📁 GEO Reference',   admin: true,  title: 'GEO reference',     desc: 'Manage City / Barangay / Location Tagging by NAP ID.' },
-    { id: 'admins',    label: '👥 Admin Management', admin: true, title: 'Admin management', desc: 'Control who has access to admin-only pages.' },
-    { id: 'about',     label: 'ℹ️ About',            admin: false, title: 'About',             desc: 'How the converter works and what its limits are.' }
+    { id: 'converter', label: '📡 Converter',        admin: false, title: 'Converter',         desc: 'Upload a NAP CSV, get a cleaned Excel back. All processing runs in your browser — no server limits.' },
+    { id: 'geo',       label: '📁 GEO Reference',    admin: true,  title: 'GEO reference',     desc: 'Manage City / Barangay / Location Tagging by NAP ID.' },
+    { id: 'admins',    label: '👥 Admin Management', admin: true,  title: 'Admin management',  desc: 'Control who has access to admin-only pages.' },
+    { id: 'about',     label: 'ℹ️ About',             admin: false, title: 'About',             desc: 'How the converter works and what its limits are.' }
   ];
 
   let session = { email: '', isAdmin: false };
-  let bulkPayload = null;
+  let geoData = null;            // {napId: [city, brgy, loc]}
+  let bulkPayload = null;        // parsed rows ready to upload
 
+  // ============================================================
+  // Boilerplate
+  // ============================================================
   function call(fn, ...args) {
     return new Promise((resolve, reject) => {
       google.script.run
@@ -19,23 +26,19 @@
         [fn](...args);
     });
   }
+  const $  = (sel, root) => (root || document).querySelector(sel);
+  const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+  const fmtNum = n => Number(n || 0).toLocaleString();
+  const todayISO = () => { const d = new Date(); return d.toISOString().slice(0,10); };
+  const fmtBytes = b => b > 1048576 ? (b/1048576).toFixed(1) + ' MB' : (b/1024).toFixed(1) + ' KB';
+  const fmtDuration = ms => ms < 1000 ? ms + ' ms' : (ms/1000).toFixed(1) + ' s';
 
-  function $(sel, root) { return (root || document).querySelector(sel); }
-  function $$(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
-  function fmtNum(n) { return Number(n || 0).toLocaleString(); }
-  function todayISO() { return new Date().toISOString().slice(0, 10); }
-
-  function setPage(id) {
-    location.hash = id;
-    renderNav();
-    render(id);
-  }
+  function setPage(id) { location.hash = id; renderNav(); render(id); }
 
   function renderNav() {
-    const nav = $('#nav');
-    nav.innerHTML = '';
+    const nav = $('#nav'); nav.innerHTML = '';
     const current = (location.hash || '#converter').slice(1);
     PAGES.forEach(p => {
       if (p.admin && !session.isAdmin) return;
@@ -48,14 +51,11 @@
     $('#me').innerHTML = session.email
       ? `<strong>${esc(session.email)}</strong>${session.isAdmin ? 'Admin' : 'User'}`
       : `<em>Not signed in</em>`;
-
     const up = $('#userPill');
     if (session.email) {
       up.style.display = 'inline-flex';
       up.innerHTML = `👤 ${esc(session.email)}${session.isAdmin ? ' · Admin' : ''}`;
-    } else {
-      up.style.display = 'none';
-    }
+    } else up.style.display = 'none';
     $('#todayPill').textContent = 'Today · ' + new Date().toLocaleDateString();
   }
 
@@ -72,102 +72,377 @@
     const tpl = $('#tpl-' + id);
     $('#view').innerHTML = '';
     $('#view').appendChild(tpl.content.cloneNode(true));
-    ({ converter: initConverter, history: initHistory, geo: initGeo,
-       admins: initAdmins, about: initAbout })[id]();
+    ({ converter: initConverter, geo: initGeo, admins: initAdmins, about: initAbout })[id]();
   }
 
-  // -------------------- CONVERTER --------------------
+  // ============================================================
+  // CONVERTER (all client-side)
+  // ============================================================
+  const OUTPUT_COLS = ['Cabinet','NAP ID','Discovered When','PLA ID','Tech',
+    'Ports Assigned','Ports Reserved','Ports Total','UTILIZATION',
+    'Latitude','Longitude','SALES_AREA','TERRITORY','BRGY_NAME',
+    'CITY_NAME','PROVINCE_NAME','LOCATION TAGGING'];
+
+  const TRAILING_COLS = 12;
+  const JUNK_PATTERNS = [
+    /^\s*nap facility summary report/i,
+    /^\s*object\s*:/i,
+    /^\s*specified report/i,
+    /^\s*nap name pattern/i,
+    /^\s*report results/i,
+    /^\s*\d+\s+rows?\s+are\s+displayed/i,
+    /^\s*location\s*$/i
+  ];
+
+  function isJunkRow(raw) {
+    const first = raw.split(';')[0].trim();
+    for (let i = 0; i < JUNK_PATTERNS.length; i++) if (JUNK_PATTERNS[i].test(first)) return true;
+    return false;
+  }
+
+  function parseRaw(raw) {
+    const fields = raw.split(';');
+    const n = fields.length;
+    if (n < TRAILING_COLS + 6) return null;
+    const tail = fields.slice(n - TRAILING_COLS);
+    return {
+      cabinet:        (tail[4]   || '').trim(),
+      napId:          (fields[1] || '').trim(),
+      lat:            (tail[0]   || '').trim(),
+      lon:            (tail[1]   || '').trim(),
+      discovered:     (tail[2]   || '').trim(),
+      portsTotal:     (tail[6]   || '').trim(),
+      portsAssigned:  (tail[7]   || '').trim(),
+      portsReserved:  (tail[8]   || '').trim()
+    };
+  }
+
+  function stripSuffix(napId) {
+    return String(napId || '').replace(/(\d)[A-Za-z]$/, '$1');
+  }
+
+  function getNapPrefix(napId) {
+    if (!napId) return '';
+    const u = String(napId).trim().toUpperCase();
+    for (let i = 0; i < SORTED_PREFIXES.length; i++) {
+      if (u.indexOf(SORTED_PREFIXES[i]) === 0) return SORTED_PREFIXES[i];
+    }
+    return '';
+  }
+
+  function getTerritory(napId) {
+    if (!napId) return '';
+    const u = String(napId).trim().toUpperCase();
+    for (let i = 0; i < SORTED_PREFIXES.length; i++) {
+      const p = SORTED_PREFIXES[i];
+      if (u === p) return PREFIX_TERRITORY[p];
+      if (u.length > p.length) {
+        const next = u.charAt(p.length);
+        const isDelim = next === '_' || next === '-' || next === 'L' || (next >= '0' && next <= '9');
+        if (isDelim && u.indexOf(p) === 0) return PREFIX_TERRITORY[p];
+      }
+    }
+    return '';
+  }
+
+  function getSalesArea(napId) { return NAP_AREA_LOOKUP[getNapPrefix(napId)] || ''; }
+  function getProvince(napId)  { return NAP_PROVINCE_LOOKUP[getNapPrefix(napId)] || ''; }
+
+  function getTech(cabinet) {
+    if (!cabinet) return '';
+    const u = String(cabinet).toUpperCase();
+    if (u.indexOf('LSA') !== -1) return 'GPON';
+    if (cabinet.indexOf('-M') !== -1) return CABINET_TECH_LOOKUP[cabinet] || 'ADSL/VDSL';
+    return 'GPON';
+  }
+
+  function getPlaId(cabinet) {
+    if (!cabinet) return '';
+    const parts = String(cabinet).trim().split('_');
+    if (parts.length >= 2) {
+      const k2 = parts[0] + '_' + parts[1];
+      if (PLA_ID_LOOKUP[k2] != null) return PLA_ID_LOOKUP[k2];
+    }
+    if (PLA_ID_LOOKUP[parts[0]] != null) return PLA_ID_LOOKUP[parts[0]];
+    return '';
+  }
+
+  function calcUtilization(pa, pt) {
+    const a = typeof pa === 'number' ? pa : parseInt(pa, 10);
+    const t = typeof pt === 'number' ? pt : parseInt(pt, 10);
+    if (isNaN(t)) return '';
+    if (t === 0) return 0;
+    if (isNaN(a)) return '';
+    return Math.round((a / t) * 10000) / 10000;
+  }
+
+  // ----- Streaming line reader -----
+  async function* readLines(file, onByteProgress) {
+    const reader = file.stream().pipeThrough(new TextDecoderStream('utf-8', { fatal: false })).getReader();
+    let buf = '';
+    let bytes = 0;
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          if (buf) yield buf.replace(/\r$/, '');
+          return;
+        }
+        bytes += value.length;
+        buf += value;
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          yield buf.slice(0, nl).replace(/\r$/, '');
+          buf = buf.slice(nl + 1);
+        }
+        if (onByteProgress) onByteProgress(bytes);
+      }
+    } finally {
+      try { reader.releaseLock(); } catch (e) {}
+    }
+  }
+
+  function setProgress(pct, text) {
+    $('#progressWrap').hidden = false;
+    $('#progressBar').style.width = Math.max(0, Math.min(100, pct)) + '%';
+    if (text != null) $('#progressText').textContent = text;
+  }
+  function hideProgress() { $('#progressWrap').hidden = true; }
+
+  // Yield to the event loop so progress text repaints.
+  const tick = () => new Promise(r => setTimeout(r, 0));
+
+  // ----- Converter init -----
   function initConverter() {
     $('#snapDate').value = todayISO();
-    let csvText = null;
+    let pickedFile = null;
 
     $('#file').addEventListener('change', e => {
       const f = e.target.files[0];
       if (!f) return;
-      $('#dropText').textContent = `📄 ${f.name}  (${(f.size / 1048576).toFixed(2)} MB)`;
-      const r = new FileReader();
-      r.onload = ev => { csvText = ev.target.result; $('#go').disabled = false; };
-      r.readAsText(f);
+      pickedFile = f;
+      $('#dropText').textContent = `📄 ${f.name}  (${fmtBytes(f.size)})`;
+      $('#go').disabled = false;
     });
 
     $('#go').addEventListener('click', async () => {
-      if (!csvText) return;
+      if (!pickedFile) return;
       $('#go').disabled = true;
-      $('#status').innerHTML = '⏳ Processing… large files can take a while.';
+      $('#status').innerHTML = '';
+      $('#resultTabs').hidden = true;
       try {
-        const res = await call('processNapCsv', csvText, $('#snapDate').value);
-        $('#status').innerHTML = '';
-        $('#resultTabs').hidden = false;
-        renderSummary(res);
-        renderPreview(res);
-        renderMissing(res);
-        $('#missCount').textContent = res.missing.length;
-        bindTabs($('#resultTabs'));
+        if (!geoData) {
+          setProgress(2, 'Loading GEO reference…');
+          await tick();
+          geoData = await call('getGeoData');
+        }
+        const stem = pickedFile.name.replace(/\.csv$/i, '').replace(/[^A-Za-z0-9._-]+/g, '_');
+        const outName = `${stem}_${$('#snapDate').value}_cleaned.xlsx`;
+        const res = await convertFile(pickedFile, geoData);
+
+        setProgress(98, 'Writing Excel file…');
+        await tick();
+        const blob = buildXlsxBlob(res.rows);
+        const url = URL.createObjectURL(blob);
+        setProgress(100, 'Done.');
+        setTimeout(hideProgress, 800);
+
+        renderResult({
+          read: res.read, written: res.written, skipped: res.skipped,
+          duration: res.duration, snapshotDate: $('#snapDate').value,
+          downloadUrl: url, downloadName: outName,
+          xlsxBytes: blob.size,
+          preview: res.rows.slice(0, 50), missing: res.missing
+        });
       } catch (err) {
+        hideProgress();
         $('#status').innerHTML = `<div class="err">❌ ${esc(err.message || err)}</div>`;
+        console.error(err);
       } finally {
         $('#go').disabled = false;
       }
     });
   }
 
-  function renderSummary(res) {
+  // ----- Pipeline -----
+  async function convertFile(file, geo) {
+    const started = performance.now();
+    const totalBytes = file.size;
+    let bytesRead = 0;
+    let lineNum = 0, readCount = 0, skipped = 0;
+    const merged = new Map();
+    const order = [];
+
+    // Pass 1: read + parse + filter + merge in one stream
+    setProgress(3, 'Parsing CSV…');
+    await tick();
+    let lastTick = performance.now();
+
+    for await (const raw of readLines(file, b => { bytesRead = b; })) {
+      lineNum++;
+      if (lineNum === 1) continue;                      // header row
+      if (!raw || !raw.replace(/;/g, '').trim()) continue;
+      if (isJunkRow(raw)) continue;
+      readCount++;
+
+      const rec = parseRaw(raw);
+      if (rec === null) { skipped++; continue; }
+      const territory = getTerritory(rec.napId);
+      if (!territory) { skipped++; continue; }
+
+      const base = stripSuffix(rec.napId);
+      const newPa = parseInt(rec.portsAssigned, 10);
+      const newPr = parseInt(rec.portsReserved, 10);
+      const newPt = parseInt(rec.portsTotal, 10);
+
+      let e = merged.get(base);
+      if (!e) {
+        e = {
+          cabinet: rec.cabinet, napId: base, discovered: rec.discovered,
+          lat: rec.lat, lon: rec.lon,
+          pa: isNaN(newPa) ? '' : newPa,
+          pr: isNaN(newPr) ? '' : newPr,
+          pt: isNaN(newPt) ? '' : newPt,
+          firstPt: isNaN(newPt) ? 0 : newPt,
+          territory: territory
+        };
+        merged.set(base, e); order.push(base);
+      } else {
+        const pa = typeof e.pa === 'number' ? e.pa : 0;
+        const pr = typeof e.pr === 'number' ? e.pr : 0;
+        const pt = typeof e.pt === 'number' ? e.pt : 0;
+        e.pa = pa + (isNaN(newPa) ? 0 : newPa);
+        e.pr = pr + (isNaN(newPr) ? 0 : newPr);
+        if (!isNaN(newPt) && newPt === 16 && e.firstPt === 16) e.pt = 16;
+        else e.pt = pt + (isNaN(newPt) ? 0 : newPt);
+      }
+
+      // progress + repaint every ~250ms
+      if (performance.now() - lastTick > 250) {
+        const bytePct = Math.min(80, 5 + (bytesRead / totalBytes) * 75);
+        setProgress(bytePct, `Parsing… ${fmtNum(readCount)} rows · ${fmtBytes(bytesRead)} / ${fmtBytes(totalBytes)}`);
+        await tick();
+        lastTick = performance.now();
+      }
+    }
+
+    // Pass 2: build output rows
+    setProgress(85, `Enriching ${fmtNum(order.length)} merged NAPs…`);
+    await tick();
+    const rows = new Array(order.length);
+    const missing = [];
+    lastTick = performance.now();
+
+    for (let i = 0; i < order.length; i++) {
+      const e = merged.get(order[i]);
+      const nap = e.napId;
+      const pa = e.pa, pt = e.pt;
+      const util = (typeof pa === 'number' && typeof pt === 'number') ? calcUtilization(pa, pt) : (pt === 0 ? 0 : '');
+      const g = geo[nap] || ['','',''];
+      rows[i] = [
+        e.cabinet, nap, e.discovered,
+        getPlaId(e.cabinet), getTech(e.cabinet),
+        pa, e.pr, pt, util,
+        e.lat, e.lon,
+        getSalesArea(nap), e.territory,
+        g[1], g[0], getProvince(nap), g[2]
+      ];
+      if (!g[0] || !g[1] || !g[2]) {
+        missing.push({ napId: nap, city: g[0], brgy: g[1], location: g[2] });
+      }
+      if ((i & 4095) === 0 && performance.now() - lastTick > 250) {
+        const pct = 85 + (i / order.length) * 10;
+        setProgress(pct, `Enriching… ${fmtNum(i)} / ${fmtNum(order.length)}`);
+        await tick();
+        lastTick = performance.now();
+      }
+    }
+
+    return { rows, missing, read: readCount, skipped, written: rows.length, duration: performance.now() - started };
+  }
+
+  function buildXlsxBlob(rows) {
+    const data = [OUTPUT_COLS].concat(rows);
+    const ws = XLSX.utils.aoa_to_sheet(data);
+    ws['!cols'] = OUTPUT_COLS.map(() => ({ wch: 21 }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'NAP Data');
+    const ab = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
+    return new Blob([ab], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  }
+
+  function buildMissingXlsxBlob(missing) {
+    const headers = ['NAP ID', 'CITY_NAME', 'BRGY_NAME', 'LOCATION TAGGING'];
+    const data = [headers].concat(missing.map(m => [m.napId, m.city || '', m.brgy || '', m.location || '']));
+    const ws = XLSX.utils.aoa_to_sheet(data);
+    ws['!cols'] = [{ wch: 22 }, { wch: 24 }, { wch: 24 }, { wch: 24 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Missing Location');
+    const ab = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
+    return new Blob([ab], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  }
+
+  function triggerDownload(blob, name) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
+  }
+
+  function renderResult(res) {
+    $('#resultTabs').hidden = false;
     $('#paneSummary').innerHTML = `
       <div class="summary-stats">
         <div class="stat read"><div class="lbl">Rows read</div><div class="num">${fmtNum(res.read)}</div></div>
         <div class="stat written"><div class="lbl">Rows written</div><div class="num">${fmtNum(res.written)}</div></div>
         <div class="stat skipped"><div class="lbl">Rows skipped</div><div class="num">${fmtNum(res.skipped)}</div></div>
-        <div class="stat"><div class="lbl">Snapshot date</div><div class="num" style="font-size:18px">${esc(res.snapshotDate)}</div></div>
+        <div class="stat"><div class="lbl">Time taken</div><div class="num" style="font-size:20px">${fmtDuration(res.duration)}</div></div>
       </div>
-      <div class="ok">✅ Saved snapshot ${esc(res.snapshotDate)}</div>
-      <a class="dl" href="${esc(res.downloadUrl)}" target="_blank">⬇️ Download Excel</a>
-      <div class="meta">Also saved to Drive under <code>NAP Converter Output</code>.</div>`;
-  }
+      <div class="ok">✅ Conversion complete · output is ${fmtBytes(res.xlsxBytes)}</div>
+      <a class="dl" id="dlMain" href="${esc(res.downloadUrl)}" download="${esc(res.downloadName)}">⬇️ Download Excel</a>
+      <div class="meta">Report date label: <code>${esc(res.snapshotDate)}</code> · file: <code>${esc(res.downloadName)}</code></div>`;
 
-  function renderPreview(res) {
-    if (!res.preview.length) { $('#panePreview').innerHTML = '<p class="sub">No rows.</p>'; return; }
-    const cols = Object.keys(res.preview[0]);
-    const head = cols.map(c => `<th>${esc(c)}</th>`).join('');
-    const body = res.preview.map(r =>
-      '<tr>' + cols.map(c => `<td>${esc(r[c])}</td>`).join('') + '</tr>').join('');
-    $('#panePreview').innerHTML =
-      `<div class="scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
-  }
-
-  function renderMissing(res) {
-    const m = res.missing;
-    if (!m.length) {
-      $('#paneMissing').innerHTML = '<p class="ok">✅ No missing-location records. 🎉</p>';
-      return;
+    // Preview tab
+    if (!res.preview.length) {
+      $('#panePreview').innerHTML = '<p class="sub">No rows.</p>';
+    } else {
+      const head = OUTPUT_COLS.map(c => `<th>${esc(c)}</th>`).join('');
+      const body = res.preview.map(r =>
+        '<tr>' + r.map(v => `<td>${esc(v)}</td>`).join('') + '</tr>').join('');
+      $('#panePreview').innerHTML =
+        `<div class="scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
     }
-    const rows = m.map(r => `<tr>
-        <td><strong>${esc(r.napId)}</strong></td>
-        <td>${r.city ? '<span class="chip ok">✓ ' + esc(r.city) + '</span>' : '<span class="chip err">missing</span>'}</td>
-        <td>${r.brgy ? '<span class="chip ok">✓ ' + esc(r.brgy) + '</span>' : '<span class="chip err">missing</span>'}</td>
-        <td>${r.location ? '<span class="chip ok">✓ ' + esc(r.location) + '</span>' : '<span class="chip err">missing</span>'}</td>
-      </tr>`).join('');
-    $('#paneMissing').innerHTML = `
-      <div class="warn">⚠️ ${fmtNum(m.length)} record(s) missing City / Barangay / Location Tagging.</div>
-      <div class="actions">
-        <button class="primary" id="dlMissing">⬇️ Download Missing as Excel</button>
-      </div>
-      <div id="missingStatus" class="status"></div>
-      <div class="scroll" style="margin-top:14px">
-        <table><thead><tr><th>NAP ID</th><th>City</th><th>Barangay</th><th>Location Tagging</th></tr></thead><tbody>${rows}</tbody></table>
-      </div>`;
-    $('#dlMissing').onclick = async () => {
-      $('#dlMissing').disabled = true;
-      $('#missingStatus').innerHTML = '⏳ Building Excel…';
-      try {
-        const r = await call('buildMissingXlsx', m);
-        $('#missingStatus').innerHTML =
-          `<a class="dl" href="${esc(r.downloadUrl)}" target="_blank">⬇️ Open / download Excel</a>`;
-      } catch (err) {
-        $('#missingStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
-      } finally {
-        $('#dlMissing').disabled = false;
-      }
-    };
+
+    // Missing tab
+    $('#missCount').textContent = res.missing.length;
+    if (!res.missing.length) {
+      $('#paneMissing').innerHTML = '<p class="ok">✅ No missing-location records. 🎉</p>';
+    } else {
+      const rows = res.missing.slice(0, 500).map(r => `<tr>
+          <td><strong>${esc(r.napId)}</strong></td>
+          <td>${r.city ? '<span class="chip ok">✓ ' + esc(r.city) + '</span>' : '<span class="chip err">missing</span>'}</td>
+          <td>${r.brgy ? '<span class="chip ok">✓ ' + esc(r.brgy) + '</span>' : '<span class="chip err">missing</span>'}</td>
+          <td>${r.location ? '<span class="chip ok">✓ ' + esc(r.location) + '</span>' : '<span class="chip err">missing</span>'}</td>
+        </tr>`).join('');
+      const more = res.missing.length > 500
+        ? `<div class="meta">Showing first 500 of ${fmtNum(res.missing.length)}. Download the Excel below for the full list.</div>` : '';
+      $('#paneMissing').innerHTML = `
+        <div class="warn">⚠️ ${fmtNum(res.missing.length)} record(s) missing City / Barangay / Location Tagging.</div>
+        <div class="actions">
+          <button class="primary" id="dlMissing">⬇️ Download Missing as Excel</button>
+        </div>
+        ${more}
+        <div class="scroll" style="margin-top:14px">
+          <table><thead><tr><th>NAP ID</th><th>City</th><th>Barangay</th><th>Location Tagging</th></tr></thead><tbody>${rows}</tbody></table>
+        </div>`;
+      $('#dlMissing').onclick = () => {
+        const blob = buildMissingXlsxBlob(res.missing);
+        triggerDownload(blob, `missing_location_${res.snapshotDate}.xlsx`);
+      };
+    }
+
+    bindTabs($('#resultTabs'));
   }
 
   function bindTabs(root) {
@@ -181,55 +456,26 @@
     });
   }
 
-  // -------------------- HISTORY --------------------
-  async function initHistory() {
-    $('#histList').innerHTML = '<p class="sub">Loading…</p>';
-    try {
-      const list = await call('listSnapshots');
-      if (!list.length) { $('#histList').innerHTML = '<p class="sub">No saved snapshots yet.</p>'; return; }
-      $('#histList').innerHTML = list.map(s => `
-        <div class="item">
-          <div>
-            <strong>${esc(s.snapshotDate)}</strong>
-            <div class="meta">${fmtNum(s.rowCount)} rows · uploaded by ${esc(s.uploadedBy)}</div>
-          </div>
-          <button class="primary" data-date="${esc(s.snapshotDate)}">Excel</button>
-        </div>`).join('');
-      $$('#histList button').forEach(b => {
-        b.onclick = async () => {
-          const orig = b.textContent;
-          b.disabled = true; b.textContent = 'Building…';
-          try {
-            const r = await call('exportSnapshot', b.dataset.date);
-            b.outerHTML = `<a class="dl" href="${esc(r.downloadUrl)}" target="_blank">⬇️ Download</a>`;
-          } catch (err) {
-            b.textContent = orig; b.disabled = false;
-            alert(err.message || err);
-          }
-        };
-      });
-    } catch (err) {
-      $('#histList').innerHTML = `<p class="err">${esc(err.message || err)}</p>`;
-    }
-  }
-
-  // -------------------- GEO --------------------
+  // ============================================================
+  // GEO REFERENCE (admin)
+  // ============================================================
   function initGeo() {
     bindTabs($('#view .tabs'));
 
     $('#geoSave').onclick = async () => {
-      const entry = {
-        napId: $('#geoNap').value, city: $('#geoCity').value,
-        brgy: $('#geoBrgy').value, location: $('#geoLoc').value
-      };
       try {
-        const r = await call('upsertGeo', entry);
+        const r = await call('upsertGeo', {
+          napId: $('#geoNap').value, city: $('#geoCity').value,
+          brgy: $('#geoBrgy').value, location: $('#geoLoc').value
+        });
         $('#geoStatus').innerHTML = `<div class="ok">✅ ${esc(r.action)} ${esc(r.napId)}</div>`;
+        geoData = null; // force re-fetch next conversion
         refreshGeoList();
       } catch (err) {
         $('#geoStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
       }
     };
+
     $('#geoLoad').onclick = async () => {
       const napId = $('#geoNap').value.trim();
       if (!napId) return;
@@ -242,10 +488,12 @@
         $('#geoStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
       }
     };
+
     $('#geoClear').onclick = () => {
-      ['#geoNap', '#geoCity', '#geoBrgy', '#geoLoc'].forEach(s => $(s).value = '');
+      ['#geoNap','#geoCity','#geoBrgy','#geoLoc'].forEach(s => $(s).value = '');
       $('#geoStatus').innerHTML = '';
     };
+
     $('#geoDel').onclick = async () => {
       const napId = $('#geoNap').value.trim();
       if (!napId) return;
@@ -253,33 +501,60 @@
       if (!confirm('This cannot be undone. Really delete?')) return;
       try {
         const r = await call('deleteGeo', napId);
-        $('#geoStatus').innerHTML = r.deleted
-          ? `<div class="ok">🗑️ Deleted.</div>` : '<div class="warn">Not found.</div>';
+        $('#geoStatus').innerHTML = r.deleted ? `<div class="ok">🗑️ Deleted.</div>` : '<div class="warn">Not found.</div>';
+        geoData = null;
         refreshGeoList();
       } catch (err) {
         $('#geoStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
       }
     };
 
-    $('#bulkFile').addEventListener('change', e => {
+    $('#bulkFile').addEventListener('change', async e => {
       const f = e.target.files[0];
       if (!f) return;
-      $('#bulkText').textContent = `📄 ${f.name}`;
-      const r = new FileReader();
-      r.onload = ev => {
-        const b64 = ev.target.result.split(',')[1];
-        bulkPayload = { b64: b64, type: f.type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
+      $('#bulkText').textContent = `📄 ${f.name}  (${fmtBytes(f.size)})`;
+      $('#bulkStatus').innerHTML = '⏳ Parsing Excel…';
+      try {
+        const buf = await f.arrayBuffer();
+        const wb = XLSX.read(buf, { type: 'array' });
+        const sh = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sh, { defval: '' });
+        const norm = rows.map(r => {
+          const obj = {};
+          for (const k in r) obj[String(k).trim().toUpperCase()] = r[k];
+          return {
+            napId:    String(obj['NAP ID'] || '').trim(),
+            city:     String(obj['CITY_NAME'] || '').trim(),
+            brgy:     String(obj['BRGY_NAME'] || '').trim(),
+            location: String(obj['LOCATION TAGGING'] || '').trim()
+          };
+        }).filter(r => r.napId);
+        if (!norm.length) throw new Error('No rows with a NAP ID column.');
+        bulkPayload = norm;
+        $('#bulkStatus').innerHTML = `<div class="ok">Found ${fmtNum(norm.length)} row(s). Click Upload to send.</div>`;
         $('#bulkGo').disabled = false;
-      };
-      r.readAsDataURL(f);
+      } catch (err) {
+        $('#bulkStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
+        $('#bulkGo').disabled = true;
+      }
     });
+
     $('#bulkGo').onclick = async () => {
       if (!bulkPayload) return;
       $('#bulkGo').disabled = true;
       $('#bulkStatus').innerHTML = '⏳ Uploading…';
       try {
-        const r = await call('bulkUpsertGeo', bulkPayload.b64, bulkPayload.type);
-        $('#bulkStatus').innerHTML = `<div class="ok">✅ ${fmtNum(r.processed)} processed — ${fmtNum(r.added)} added, ${fmtNum(r.updated)} updated.</div>`;
+        // Send in chunks of 1000 to stay well under the google.script.run payload limit.
+        const CHUNK = 1000;
+        let added = 0, updated = 0;
+        for (let i = 0; i < bulkPayload.length; i += CHUNK) {
+          const slice = bulkPayload.slice(i, i + CHUNK);
+          const r = await call('bulkUpsertGeoRows', slice);
+          added += r.added; updated += r.updated;
+          $('#bulkStatus').innerHTML = `⏳ Uploading… ${fmtNum(Math.min(i + CHUNK, bulkPayload.length))} / ${fmtNum(bulkPayload.length)}`;
+        }
+        $('#bulkStatus').innerHTML = `<div class="ok">✅ ${fmtNum(added + updated)} processed — ${fmtNum(added)} added, ${fmtNum(updated)} updated.</div>`;
+        geoData = null;
       } catch (err) {
         $('#bulkStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
       } finally {
@@ -300,10 +575,8 @@
         <th>NAP ID</th><th>City</th><th>Barangay</th><th>Location Tagging</th><th>Updated</th></tr></thead><tbody>
         ${list.map(r => `<tr>
           <td><strong>${esc(r.napId)}</strong></td>
-          <td>${esc(r.city)}</td>
-          <td>${esc(r.brgy)}</td>
-          <td>${esc(r.location)}</td>
-          <td class="meta">${esc((r.updatedAt || '').slice(0, 10))} ${esc(r.updatedBy)}</td>
+          <td>${esc(r.city)}</td><td>${esc(r.brgy)}</td><td>${esc(r.location)}</td>
+          <td class="meta">${esc((r.updatedAt || '').slice(0,10))} ${esc(r.updatedBy)}</td>
         </tr>`).join('')}</tbody></table></div>`;
     } catch (err) {
       $('#geoList').innerHTML = `<p class="err">${esc(err.message || err)}</p>`;
@@ -314,7 +587,9 @@
     let t; return function () { clearTimeout(t); t = setTimeout(() => fn.apply(this, arguments), ms); };
   }
 
-  // -------------------- ADMINS --------------------
+  // ============================================================
+  // ADMINS
+  // ============================================================
   function initAdmins() {
     $('#adminAdd').onclick = async () => {
       const email = $('#adminEmail').value.trim();
@@ -338,7 +613,7 @@
         ? list.map(a => `<div class="item">
             <div>
               <strong>${esc(a.email)}</strong>
-              <div class="meta">added ${esc((a.addedAt || '').slice(0, 10))} by ${esc(a.addedBy)}</div>
+              <div class="meta">added ${esc((a.addedAt || '').slice(0,10))} by ${esc(a.addedBy)}</div>
             </div>
             <button class="danger" data-email="${esc(a.email)}">Remove</button>
           </div>`).join('')
@@ -346,10 +621,8 @@
       $$('#adminList button').forEach(b => {
         b.onclick = async () => {
           if (!confirm(`Remove admin ${b.dataset.email}?`)) return;
-          try {
-            await call('removeAdmin', b.dataset.email);
-            refreshAdmins();
-          } catch (err) { alert(err.message || err); }
+          try { await call('removeAdmin', b.dataset.email); refreshAdmins(); }
+          catch (err) { alert(err.message || err); }
         };
       });
     } catch (err) {
@@ -357,21 +630,19 @@
     }
   }
 
-  // -------------------- ABOUT --------------------
+  // ============================================================
+  // ABOUT
+  // ============================================================
   function initAbout() {
-    const cols = ['Cabinet','NAP ID','Discovered When','PLA ID','Tech','Ports Assigned','Ports Reserved',
-      'Ports Total','UTILIZATION','Latitude','Longitude','SALES_AREA','TERRITORY','BRGY_NAME','CITY_NAME',
-      'PROVINCE_NAME','LOCATION TAGGING'];
-    $('#view .cols').innerHTML = cols.map(c => `<li>${esc(c)}</li>`).join('');
+    $('#view .cols').innerHTML = OUTPUT_COLS.map(c => `<li>${esc(c)}</li>`).join('');
   }
 
-  // -------------------- BOOT --------------------
+  // ============================================================
+  // Boot
+  // ============================================================
   (async function boot() {
-    try {
-      session = await call('getSession');
-    } catch (e) {
-      session = { email: '', isAdmin: false };
-    }
+    try { session = await call('getSession'); }
+    catch (e) { session = { email: '', isAdmin: false }; }
     const initial = (location.hash || '#converter').slice(1);
     const allowed = PAGES.find(p => p.id === initial && (!p.admin || session.isAdmin));
     setPage(allowed ? initial : 'converter');
