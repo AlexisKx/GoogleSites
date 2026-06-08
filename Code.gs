@@ -1,20 +1,24 @@
 /**
- * NAP Data Converter — Google Apps Script port of the Streamlit app
- * (AlexisKx/NAP_CONVERTER_APP → Google Sites + Apps Script).
+ * NAP Data Converter — Google Apps Script port of app_to_xlsx1.py.
  *
- * All five Streamlit pages are reproduced as a single web app:
- *   - 📡 Converter
- *   - 🕓 Data History
- *   - 📁 GEO Reference   (admin)
- *   - 👥 Admin Management (admin)   ← replaces "User Management"; SSO handles identity
- *   - ℹ️  About / Handover
+ * Parsing, merge, and enrichment match the Python exactly:
+ *   - parseRow reads cabinet from tail[4], not fields[0]
+ *   - PLA ID + Tech are derived from the cabinet string (not looked up in a tab)
+ *   - Sales Area / Province / Territory are derived from NAP-ID prefix
+ *   - merge key = strip_suffix(nap_id) — one trailing letter after a digit
+ *   - junk header rows are skipped
+ *   - records outside Territory-7 prefixes are filtered out
+ *   - ports_total special case: two 16s stay 16, otherwise summed
  *
- * Auth: Workspace SSO via Session.getActiveUser(). An ADMINS tab in the lookup
- * sheet controls who sees admin-only pages.
+ * Big lookup dictionaries (CABINET_TECH_LOOKUP, PLA_ID_LOOKUP,
+ * NAP_AREA_LOOKUP, NAP_PROVINCE_LOOKUP, PREFIX_TERRITORY) live in
+ * Lookups.gs.
  *
- * Storage: one Google Sheet ("Lookup Spreadsheet") holds every tab.
- *   - ADMINS, MASTER, PLA_BY_CABINET, AREA_BY_PREFIX, GEO_REFERENCE,
- *     NAP_DATA (snapshots), SNAPSHOT_INDEX (one row per saved snapshot).
+ * Storage: one Google Sheet ("Lookup Spreadsheet") with these tabs:
+ *   ADMINS, GEO_REFERENCE, NAP_DATA, SNAPSHOT_INDEX.
+ *
+ * Auth: Workspace SSO via Session.getActiveUser(). The ADMINS tab is the
+ * allowlist for admin-only pages.
  *
  * Run setupSheets() once from the script editor to create the tabs.
  */
@@ -24,19 +28,16 @@ const CONFIG = {
   LOOKUP_SPREADSHEET_ID: 'PASTE_YOUR_LOOKUP_SPREADSHEET_ID_HERE',
 
   TABS: {
-    ADMINS:          'ADMINS',
-    MASTER:          'MASTER',
-    PLA_BY_CABINET:  'PLA_BY_CABINET',
-    AREA_BY_PREFIX:  'AREA_BY_PREFIX',
-    GEO_REFERENCE:   'GEO_REFERENCE',
-    NAP_DATA:        'NAP_DATA',
-    SNAPSHOT_INDEX:  'SNAPSHOT_INDEX'
+    ADMINS:         'ADMINS',
+    GEO_REFERENCE:  'GEO_REFERENCE',
+    NAP_DATA:       'NAP_DATA',
+    SNAPSHOT_INDEX: 'SNAPSHOT_INDEX'
   },
 
-  TRAILING_COLS: 12,
-  OUTPUT_FOLDER_NAME: 'NAP Converter Output',
-  GEO_CACHE_SECONDS: 300,
-  SEED_ADMIN_EMAIL: ''   // optional: email auto-promoted to admin on first setupSheets()
+  TRAILING_COLS:       12,
+  OUTPUT_FOLDER_NAME:  'NAP Converter Output',
+  GEO_CACHE_SECONDS:   300,
+  SEED_ADMIN_EMAIL:    ''   // optional: email auto-promoted to admin on first setupSheets()
 };
 
 const OUTPUT_COLS = ['Cabinet', 'NAP ID', 'Discovered When', 'PLA ID', 'Tech',
@@ -49,14 +50,23 @@ const SNAPSHOT_INDEX_COLS = ['snapshot_date', 'uploaded_by', 'uploaded_at', 'row
 const GEO_HEADERS = ['NAP ID', 'CITY_NAME', 'BRGY_NAME', 'LOCATION TAGGING', 'updated_at', 'updated_by'];
 const ADMIN_HEADERS = ['email', 'added_at', 'added_by'];
 
-const COORD_RE = /^-?\d{1,3}\.\d{4,}$/;
+// Junk header lines (output from the source system) to skip.
+const JUNK_PATTERNS = [
+  /^\s*nap facility summary report/i,
+  /^\s*object\s*:/i,
+  /^\s*specified report/i,
+  /^\s*nap name pattern/i,
+  /^\s*report results/i,
+  /^\s*\d+\s+rows?\s+are\s+displayed/i,
+  /^\s*location\s*$/i
+];
 
 // ============================ WEB APP ENTRY ============================
 function doGet() {
   return HtmlService.createTemplateFromFile('Index').evaluate()
     .setTitle('NAP Data Converter')
     .addMetaTag('viewport', 'width=device-width, initial-scale=1')
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);  // needed for Google Sites embed
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
 function include(name) {
@@ -72,10 +82,11 @@ function getSession() {
 
 function isAdmin_(email) {
   if (!email) return false;
-  const ss = openLookupSheet_();
-  const sh = ss.getSheetByName(CONFIG.TABS.ADMINS);
+  const sh = openLookupSheet_().getSheetByName(CONFIG.TABS.ADMINS);
   if (!sh) return false;
-  const v = sh.getRange(2, 1, Math.max(sh.getLastRow() - 1, 0), 1).getValues();
+  const last = sh.getLastRow();
+  if (last < 2) return false;
+  const v = sh.getRange(2, 1, last - 1, 1).getValues();
   for (let i = 0; i < v.length; i++) {
     if (String(v[i][0]).trim().toLowerCase() === email.toLowerCase()) return true;
   }
@@ -88,51 +99,16 @@ function requireAdmin_() {
   return s;
 }
 
-// ============================ PARSING (matches Python) ============================
-function parseRow_(raw) {
-  const fields = raw.split(';');
-  const n = fields.length;
-  if (n < CONFIG.TRAILING_COLS + 6) return null;
-  const tail = fields.slice(n - CONFIG.TRAILING_COLS);
-  return {
-    cabinet:       (fields[0] || '').trim(),
-    napId:         (fields[1] || '').trim(),
-    discovered:    (tail[2]  || '').trim(),
-    portsAssigned: (tail[7]  || '').trim(),
-    portsReserved: (tail[8]  || '').trim(),
-    portsTotal:    (tail[6]  || '').trim(),
-    lat:           (tail[0]  || '').trim(),
-    lon:           (tail[1]  || '').trim()
-  };
+// ============================ HELPERS ============================
+function s_(x) { return String(x == null ? '' : x).trim(); }
+
+function toInt_(v) {
+  const n = parseInt(v, 10);
+  return isNaN(n) ? '' : n;
 }
 
-function toCoord_(v) {
-  v = (v || '').trim();
-  return COORD_RE.test(v) ? Number(v) : '';
-}
+function isInt_(v) { return typeof v === 'number' && Math.floor(v) === v; }
 
-function calcUtilization_(pa, pt) {
-  const a = parseInt(pa, 10), t = parseInt(pt, 10);
-  if (!t || isNaN(t) || isNaN(a)) return '';
-  return Math.round((a / t) * 10000) / 10000;
-}
-
-// Leading alphabetic portion — used for AREA_BY_PREFIX lookup.
-function napPrefix_(napId) {
-  const m = (napId || '').match(/^[A-Za-z]+/);
-  return m ? m[0].toUpperCase() : '';
-}
-
-// "Base NAP ID" used as the merge key. The Streamlit version says duplicates
-// are merged by base NAP ID with a suffix stripped; the exact suffix rule
-// isn't in the handover, so we strip a trailing "-NNN" / "_NNN" / final
-// "-X" if present. >>> RECONCILE against app.py.merge_duplicates() <<<
-function baseNapId_(napId) {
-  if (!napId) return '';
-  return String(napId).replace(/[-_][A-Za-z0-9]+$/, '').trim() || String(napId).trim();
-}
-
-// ============================ LOOKUPS ============================
 function openLookupSheet_() {
   if (!CONFIG.LOOKUP_SPREADSHEET_ID || CONFIG.LOOKUP_SPREADSHEET_ID.indexOf('PASTE_') === 0) {
     throw new Error('CONFIG.LOOKUP_SPREADSHEET_ID is not set. Edit Code.gs.');
@@ -140,60 +116,134 @@ function openLookupSheet_() {
   return SpreadsheetApp.openById(CONFIG.LOOKUP_SPREADSHEET_ID);
 }
 
-function readTab_(name) {
-  const sh = openLookupSheet_().getSheetByName(name);
-  if (!sh) return [];
-  const v = sh.getDataRange().getValues();
-  return v.length > 1 ? v.slice(1) : [];
+// ============================ PARSING (matches Python) ============================
+function isJunkRow_(raw) {
+  const firstField = raw.split(';')[0].trim();
+  for (let i = 0; i < JUNK_PATTERNS.length; i++) {
+    if (JUNK_PATTERNS[i].test(firstField)) return true;
+  }
+  return false;
 }
 
-function s_(x) { return String(x == null ? '' : x).trim(); }
+function parseRaw_(raw) {
+  const fields = raw.split(';');
+  const n = fields.length;
+  if (n < CONFIG.TRAILING_COLS + 6) return null;
+  const tail = fields.slice(n - CONFIG.TRAILING_COLS);
+  return {
+    cabinet:        (tail[4]    || '').trim(),
+    napId:          (fields[1]  || '').trim(),
+    status:         (fields[2]  || '').trim(),
+    lat:            (tail[0]    || '').trim(),
+    lon:            (tail[1]    || '').trim(),
+    discovered:     (tail[2]    || '').trim(),
+    portsTotal:     (tail[6]    || '').trim(),
+    portsAssigned:  (tail[7]    || '').trim(),
+    portsReserved:  (tail[8]    || '').trim()
+  };
+}
 
-function loadLookups_() {
-  const cache = CacheService.getScriptCache();
-  const cached = cache.get('lookups_v1');
-  if (cached) {
-    try { return JSON.parse(cached); } catch (e) { /* fall through */ }
+// Coordinates: Python trims and returns as a string; no regex validation.
+function toCoord_(v) { return s_(v); }
+
+// strip_suffix: remove one trailing letter that follows a digit (e.g. DVO123A → DVO123).
+function stripSuffix_(napId) {
+  return String(napId || '').replace(/(\d)[A-Za-z]$/, '$1');
+}
+
+// ============================ ENRICHMENT (matches Python) ============================
+let _sortedPrefixes = null;
+function sortedPrefixes_() {
+  if (_sortedPrefixes) return _sortedPrefixes;
+  _sortedPrefixes = Object.keys(PREFIX_TERRITORY).slice()
+    .sort(function (a, b) { return b.length - a.length; });
+  return _sortedPrefixes;
+}
+
+function getNapPrefix_(napId) {
+  if (!napId) return '';
+  const u = String(napId).trim().toUpperCase();
+  const ps = sortedPrefixes_();
+  for (let i = 0; i < ps.length; i++) {
+    if (u.indexOf(ps[i]) === 0) return ps[i];
   }
+  return '';
+}
 
-  const master = {};
-  readTab_(CONFIG.TABS.MASTER).forEach(function (r) {
-    const nap = s_(r[0]);
-    if (!nap) return;
-    master[nap] = {
-      pla: s_(r[1]), tech: s_(r[2]), territory: s_(r[3]), area: s_(r[4]),
-      province: s_(r[5]), city: s_(r[6]), brgy: s_(r[7]), location: s_(r[8])
-    };
-  });
+function getSalesArea_(napId) { return NAP_AREA_LOOKUP[getNapPrefix_(napId)] || ''; }
+function getProvince_(napId)  { return NAP_PROVINCE_LOOKUP[getNapPrefix_(napId)] || ''; }
 
-  const plaByCabinet = {};
-  readTab_(CONFIG.TABS.PLA_BY_CABINET).forEach(function (r) {
-    const cab = s_(r[0]);
-    if (!cab) return;
-    plaByCabinet[cab] = { pla: s_(r[1]), tech: s_(r[2]) };
-  });
+// Stricter prefix match: requires next char to be _, -, digit, or L.
+function getTerritory_(napId) {
+  if (!napId) return '';
+  const u = String(napId).trim().toUpperCase();
+  const ps = sortedPrefixes_();
+  for (let i = 0; i < ps.length; i++) {
+    const p = ps[i].toUpperCase();
+    if (u === p) return PREFIX_TERRITORY[ps[i]];
+    if (u.length > p.length) {
+      const next = u.charAt(p.length);
+      const isDelim = (next === '_' || next === '-' || next === 'L' || (next >= '0' && next <= '9'));
+      if (isDelim && u.indexOf(p) === 0) return PREFIX_TERRITORY[ps[i]];
+    }
+  }
+  return '';
+}
 
-  const areaByPrefix = {};
-  readTab_(CONFIG.TABS.AREA_BY_PREFIX).forEach(function (r) {
-    const pfx = s_(r[0]).toUpperCase();
-    if (!pfx) return;
-    areaByPrefix[pfx] = { area: s_(r[1]), province: s_(r[2]), territory: s_(r[3]) };
-  });
+function getTech_(cabinet) {
+  if (!cabinet) return '';
+  const u = String(cabinet).toUpperCase();
+  if (u.indexOf('LSA') !== -1) return 'GPON';
+  if (cabinet.indexOf('-M') !== -1) return CABINET_TECH_LOOKUP[cabinet] || 'ADSL/VDSL';
+  return 'GPON';
+}
 
-  const geo = {};
-  readTab_(CONFIG.TABS.GEO_REFERENCE).forEach(function (r) {
-    const nap = s_(r[0]);
-    if (!nap) return;
-    geo[nap] = { city: s_(r[1]), brgy: s_(r[2]), location: s_(r[3]) };
-  });
+function getPlaId_(cabinet) {
+  if (!cabinet) return '';
+  const parts = String(cabinet).trim().split('_');
+  if (parts.length >= 2) {
+    const k2 = parts[0] + '_' + parts[1];
+    if (PLA_ID_LOOKUP[k2] != null) return PLA_ID_LOOKUP[k2];
+  }
+  if (PLA_ID_LOOKUP[parts[0]] != null) return PLA_ID_LOOKUP[parts[0]];
+  return '';
+}
 
-  const out = { master: master, plaByCabinet: plaByCabinet, areaByPrefix: areaByPrefix, geo: geo };
-  try { cache.put('lookups_v1', JSON.stringify(out), CONFIG.GEO_CACHE_SECONDS); } catch (e) {}
+function calcUtilization_(pa, pt) {
+  const a = (typeof pa === 'number') ? pa : parseInt(pa, 10);
+  const t = (typeof pt === 'number') ? pt : parseInt(pt, 10);
+  if (isNaN(t)) return '';
+  if (t === 0) return 0;
+  if (isNaN(a)) return '';
+  return Math.round((a / t) * 10000) / 10000;
+}
+
+// ============================ GEO LOOKUP ============================
+function loadGeoLookup_() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get('geo_v1');
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) {}
+  }
+  const sh = openLookupSheet_().getSheetByName(CONFIG.TABS.GEO_REFERENCE);
+  const out = {};
+  if (sh) {
+    const last = sh.getLastRow();
+    if (last >= 2) {
+      const v = sh.getRange(2, 1, last - 1, 4).getValues();
+      for (let i = 0; i < v.length; i++) {
+        const nap = s_(v[i][0]);
+        if (!nap) continue;
+        out[nap] = { city: s_(v[i][1]), brgy: s_(v[i][2]), loc: s_(v[i][3]) };
+      }
+    }
+  }
+  try { cache.put('geo_v1', JSON.stringify(out), CONFIG.GEO_CACHE_SECONDS); } catch (e) {}
   return out;
 }
 
-function invalidateLookupCache_() {
-  try { CacheService.getScriptCache().remove('lookups_v1'); } catch (e) {}
+function invalidateGeoCache_() {
+  try { CacheService.getScriptCache().remove('geo_v1'); } catch (e) {}
 }
 
 // ============================ CONVERTER ============================
@@ -201,64 +251,87 @@ function processNapCsv(csvText, snapshotDateStr) {
   const session = getSession();
   if (!session.email) throw new Error('Sign in with your Google account first.');
 
-  const lookups = loadLookups_();
+  const geo = loadGeoLookup_();
   const lines = csvText.split(/\r\n|\n|\r/);
 
-  const merged = {};
+  // Pass 1: parse + filter
+  const recs = [];
   let readCount = 0, skipped = 0;
-
   for (let i = 0; i < lines.length; i++) {
-    if (i === 0) continue;
-    const raw = lines[i];
-    if (!raw || !raw.replace(/;/g, '').trim()) continue;
-    const rec = parseRow_(raw);
-    if (!rec) { skipped++; continue; }
+    if (i === 0) continue;                              // header row
+    const raw = (lines[i] || '');
+    if (!raw.replace(/;/g, '').trim()) continue;        // blank
+    if (isJunkRow_(raw)) continue;                      // header garbage
     readCount++;
 
-    const key = baseNapId_(rec.napId) || (rec.cabinet + '|' + i);
-    if (!merged[key]) merged[key] = {
-      cabinet: rec.cabinet, napId: baseNapId_(rec.napId) || rec.napId, discovered: rec.discovered,
-      lat: rec.lat, lon: rec.lon, _pa: 0, _pr: 0, _pt: 0
-    };
-    const m = merged[key];
-    m._pa += parseInt(rec.portsAssigned, 10) || 0;
-    m._pr += parseInt(rec.portsReserved, 10) || 0;
-    m._pt += parseInt(rec.portsTotal, 10)    || 0;
+    const rec = parseRaw_(raw);
+    if (rec === null) { skipped++; continue; }
+    if (!getTerritory_(rec.napId)) { skipped++; continue; }
+    recs.push(rec);
   }
 
+  // Pass 2: merge by base NAP ID (strip_suffix)
+  const merged = {};
+  const order = [];
+  for (let i = 0; i < recs.length; i++) {
+    const rec = recs[i];
+    const base = stripSuffix_(rec.napId);
+    if (!merged[base]) {
+      order.push(base);
+      merged[base] = {
+        cabinet:   rec.cabinet,
+        napId:     base,
+        discovered: rec.discovered,
+        lat:       rec.lat,
+        lon:       rec.lon,
+        pa:        toInt_(rec.portsAssigned),
+        pr:        toInt_(rec.portsReserved),
+        pt:        toInt_(rec.portsTotal),
+        territory: getTerritory_(rec.napId),
+        firstPt:   toInt_(rec.portsTotal)
+      };
+    } else {
+      const e = merged[base];
+      const newPa = toInt_(rec.portsAssigned), newPr = toInt_(rec.portsReserved), newPt = toInt_(rec.portsTotal);
+      const pa = isInt_(e.pa) ? e.pa : 0;
+      const pr = isInt_(e.pr) ? e.pr : 0;
+      const pt = isInt_(e.pt) ? e.pt : 0;
+      const firstPt = isInt_(e.firstPt) ? e.firstPt : 0;
+      e.pa = pa + (isInt_(newPa) ? newPa : 0);
+      e.pr = pr + (isInt_(newPr) ? newPr : 0);
+      if (isInt_(newPt) && newPt === 16 && firstPt === 16) e.pt = 16;
+      else e.pt = pt + (isInt_(newPt) ? newPt : 0);
+    }
+  }
+
+  // Pass 3: build output rows
   const rows = [];
   const missing = [];
-  Object.keys(merged).forEach(function (key) {
-    const m   = merged[key];
-    const nap = m.napId;
-    const ref = lookups.master[nap]            || {};
-    const cab = lookups.plaByCabinet[m.cabinet] || {};
-    const pfx = lookups.areaByPrefix[napPrefix_(nap)] || {};
-    const g   = lookups.geo[nap]               || {};
-
-    const pla       = ref.pla       || cab.pla       || '';
-    const tech      = ref.tech      || cab.tech      || '';
-    const territory = ref.territory || pfx.territory || '';
-    const area      = ref.area      || pfx.area      || '';
-    const province  = ref.province  || pfx.province  || '';
-    const city      = ref.city      || g.city        || '';
-    const brgy      = ref.brgy      || g.brgy        || '';
-    const location  = ref.location  || g.location    || '';
+  for (let i = 0; i < order.length; i++) {
+    const m = merged[order[i]];
+    const pa = m.pa, pt = m.pt;
+    const util = (isInt_(pa) && isInt_(pt)) ? calcUtilization_(pa, pt) : (pt === 0 ? 0 : '');
+    const g = geo[m.napId] || { city: '', brgy: '', loc: '' };
 
     rows.push([
-      m.cabinet, nap, m.discovered, pla, tech,
-      m._pa, m._pr, m._pt, calcUtilization_(m._pa, m._pt),
+      m.cabinet,
+      m.napId,
+      m.discovered,
+      getPlaId_(m.cabinet),
+      getTech_(m.cabinet),
+      pa, m.pr, pt, util,
       toCoord_(m.lat), toCoord_(m.lon),
-      area, territory, brgy, city, province, location
+      getSalesArea_(m.napId),
+      m.territory,
+      g.brgy, g.city,
+      getProvince_(m.napId),
+      g.loc
     ]);
 
-    if (!city || !brgy || !location) {
-      missing.push({
-        napId: nap, cabinet: m.cabinet,
-        city: city, brgy: brgy, location: location
-      });
+    if (!g.city || !g.brgy || !g.loc) {
+      missing.push({ napId: m.napId, city: g.city, brgy: g.brgy, location: g.loc });
     }
-  });
+  }
 
   const snapshotDate = normalizeDate_(snapshotDateStr);
   saveSnapshot_(snapshotDate, session.email, rows);
@@ -296,17 +369,16 @@ function saveSnapshot_(snapshotDate, email, rows) {
   const sh = ss.getSheetByName(CONFIG.TABS.NAP_DATA);
   if (!sh) throw new Error('NAP_DATA tab missing — run setupSheets().');
 
-  // Upsert: remove existing rows for this date, then append new ones.
   const last = sh.getLastRow();
   if (last > 1) {
     const dateCol = sh.getRange(2, 1, last - 1, 1).getValues();
-    const keepRows = [];
+    const keep = [];
     for (let i = 0; i < dateCol.length; i++) {
-      if (String(dateCol[i][0]) !== snapshotDate) keepRows.push(i);
+      if (String(dateCol[i][0]) !== snapshotDate) keep.push(i);
     }
-    if (keepRows.length !== dateCol.length) {
+    if (keep.length !== dateCol.length) {
       const all = sh.getRange(2, 1, last - 1, SNAPSHOT_COLS.length).getValues();
-      const kept = keepRows.map(function (i) { return all[i]; });
+      const kept = keep.map(function (i) { return all[i]; });
       sh.getRange(2, 1, last - 1, SNAPSHOT_COLS.length).clearContent();
       if (kept.length) sh.getRange(2, 1, kept.length, SNAPSHOT_COLS.length).setValues(kept);
     }
@@ -349,9 +421,9 @@ function listSnapshots() {
   return v.map(function (r) {
     return {
       snapshotDate: normalizeDate_(r[0]),
-      uploadedBy: s_(r[1]),
-      uploadedAt: r[2] ? new Date(r[2]).toISOString() : '',
-      rowCount: Number(r[3]) || 0
+      uploadedBy:   s_(r[1]),
+      uploadedAt:   r[2] ? new Date(r[2]).toISOString() : '',
+      rowCount:     Number(r[3]) || 0
     };
   }).sort(function (a, b) { return a.snapshotDate < b.snapshotDate ? 1 : -1; });
 }
@@ -360,7 +432,6 @@ function exportSnapshot(snapshotDate) {
   const session = getSession();
   if (!session.email) throw new Error('Sign in first.');
   snapshotDate = normalizeDate_(snapshotDate);
-
   const sh = openLookupSheet_().getSheetByName(CONFIG.TABS.NAP_DATA);
   const last = sh.getLastRow();
   if (last < 2) throw new Error('No data for ' + snapshotDate);
@@ -368,7 +439,6 @@ function exportSnapshot(snapshotDate) {
   const rows = all.filter(function (r) { return String(r[0]) === snapshotDate; })
                   .map(function (r) { return r.slice(2); });
   if (!rows.length) throw new Error('No data for ' + snapshotDate);
-
   return { downloadUrl: buildXlsx_('NAP_cleaned_' + snapshotDate, rows), rowCount: rows.length };
 }
 
@@ -471,13 +541,13 @@ function upsertGeo(entry) {
       if (s_(v[i][0]) === napId) {
         sh.getRange(i + 2, 1, 1, GEO_HEADERS.length)
           .setValues([[napId, city, brgy, location, now, session.email]]);
-        invalidateLookupCache_();
+        invalidateGeoCache_();
         return { napId: napId, action: 'updated' };
       }
     }
   }
   sh.appendRow([napId, city, brgy, location, now, session.email]);
-  invalidateLookupCache_();
+  invalidateGeoCache_();
   return { napId: napId, action: 'added' };
 }
 
@@ -491,7 +561,7 @@ function deleteGeo(napId) {
   for (let i = 0; i < v.length; i++) {
     if (s_(v[i][0]) === napId) {
       sh.deleteRow(i + 2);
-      invalidateLookupCache_();
+      invalidateGeoCache_();
       return { deleted: true };
     }
   }
@@ -549,7 +619,7 @@ function bulkUpsertGeo(xlsxBase64, mimeType) {
   if (appendBuf.length) {
     target.getRange(target.getLastRow() + 1, 1, appendBuf.length, GEO_HEADERS.length).setValues(appendBuf);
   }
-  invalidateLookupCache_();
+  invalidateGeoCache_();
   return { processed: added + updated, added: added, updated: updated };
 }
 
@@ -603,9 +673,6 @@ function setupSheets() {
   const ss = openLookupSheet_();
   const need = [
     [CONFIG.TABS.ADMINS,         ADMIN_HEADERS],
-    [CONFIG.TABS.MASTER,         ['NAP ID', 'PLA ID', 'Tech', 'Territory', 'Area', 'Province', 'City', 'BRGY', 'Location']],
-    [CONFIG.TABS.PLA_BY_CABINET, ['Cabinet', 'PLA ID', 'Tech']],
-    [CONFIG.TABS.AREA_BY_PREFIX, ['Prefix', 'Sales Area', 'Province', 'Territory']],
     [CONFIG.TABS.GEO_REFERENCE,  GEO_HEADERS],
     [CONFIG.TABS.NAP_DATA,       SNAPSHOT_COLS],
     [CONFIG.TABS.SNAPSHOT_INDEX, SNAPSHOT_INDEX_COLS]
@@ -627,5 +694,5 @@ function setupSheets() {
       adminSh.appendRow([CONFIG.SEED_ADMIN_EMAIL.toLowerCase(), new Date(), 'setup']);
     }
   }
-  return 'Setup complete.';
+  return 'Setup complete. Tabs: ' + need.map(function (p) { return p[0]; }).join(', ');
 }
