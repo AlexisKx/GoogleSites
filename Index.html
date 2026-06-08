@@ -3,22 +3,34 @@
 <head>
   <base target="_top">
   <meta charset="utf-8">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <?!= include('Styles'); ?>
 </head>
 <body>
+  <header class="topbar">
+    <div class="brand-block">
+      <h1>📡 NAP DATA CONVERTER</h1>
+      <div class="tag">Territory 7 · <b>Network Access Point</b> cleanup &amp; reporting</div>
+    </div>
+    <div class="topbar-right">
+      <span class="pill"><span class="dot"></span> <span id="todayPill">Today</span></span>
+      <span class="pill" id="userPill" style="display:none"></span>
+    </div>
+  </header>
+
   <div id="app" class="app">
     <aside class="sidebar">
-      <div class="brand">📡 NAP Converter</div>
       <nav id="nav"></nav>
       <div class="me" id="me"></div>
     </aside>
 
     <main class="main">
-      <header class="topbar">
-        <h1 id="pageTitle">Converter</h1>
-        <div class="topbar-right" id="topbarRight"></div>
-      </header>
-
+      <div class="page-head">
+        <h2 id="pageTitle">Converter</h2>
+        <div class="desc" id="pageDesc"></div>
+      </div>
       <section id="view" class="view"></section>
     </main>
   </div>
@@ -31,11 +43,13 @@
           <input type="date" id="snapDate">
         </label>
         <label class="drop" id="drop">
-          <span id="dropText">Click to choose your NAP CSV</span>
+          <span id="dropText">📂 Click to choose your NAP CSV</span>
           <input type="file" id="file" accept=".csv,text/csv">
         </label>
       </div>
-      <button id="go" class="primary" disabled>🚀 Convert &amp; Save</button>
+      <div class="actions">
+        <button id="go" class="primary" disabled>🚀 Convert &amp; Save</button>
+      </div>
       <div class="status" id="status"></div>
     </div>
 
@@ -53,8 +67,8 @@
 
   <template id="tpl-history">
     <div class="card">
-      <h2>Data history</h2>
-      <p class="sub">Every saved snapshot. Click <em>Excel</em> to rebuild and download.</p>
+      <h2>Saved snapshots</h2>
+      <p class="sub">Every conversion you save shows up here. Click <em>Excel</em> to rebuild and download any past day.</p>
       <div id="histList" class="list"></div>
     </div>
   </template>
@@ -69,8 +83,10 @@
 
       <div class="tab-pane active" data-pane="edit">
         <div class="card">
+          <h2>Add or update a single entry</h2>
+          <p class="sub">Type a NAP ID, optionally click <em>Load existing</em> to prefill, then save.</p>
           <div class="grid2">
-            <label class="field"><span>NAP ID</span><input id="geoNap"></label>
+            <label class="field"><span>NAP ID</span><input id="geoNap" placeholder="e.g. DVO05L02N01"></label>
             <label class="field"><span>City</span><input id="geoCity"></label>
             <label class="field"><span>Barangay</span><input id="geoBrgy"></label>
             <label class="field"><span>Location tagging</span><input id="geoLoc"></label>
@@ -87,19 +103,23 @@
 
       <div class="tab-pane" data-pane="bulk">
         <div class="card">
-          <p class="sub">Excel must have columns: <code>NAP ID, CITY_NAME, BRGY_NAME, LOCATION TAGGING</code>.</p>
+          <h2>Bulk upload</h2>
+          <p class="sub">Excel must have columns: <code>NAP ID</code>, <code>CITY_NAME</code>, <code>BRGY_NAME</code>, <code>LOCATION TAGGING</code>. Existing NAP IDs are updated, new ones are added.</p>
           <label class="drop">
-            <span id="bulkText">Click to choose your Excel file</span>
+            <span id="bulkText">📄 Click to choose your Excel file</span>
             <input type="file" id="bulkFile" accept=".xlsx">
           </label>
-          <button class="primary" id="bulkGo" disabled>Upload</button>
+          <div class="actions">
+            <button class="primary" id="bulkGo" disabled>Upload</button>
+          </div>
           <div class="status" id="bulkStatus"></div>
         </div>
       </div>
 
       <div class="tab-pane" data-pane="view">
         <div class="card">
-          <input id="geoSearch" placeholder="Search by NAP ID, city, barangay..." class="search">
+          <h2>All entries</h2>
+          <input id="geoSearch" placeholder="Search by NAP ID, city, barangay…" class="search">
           <div id="geoList" class="list"></div>
         </div>
       </div>
@@ -109,12 +129,12 @@
   <template id="tpl-admins">
     <div class="card">
       <h2>Admin management</h2>
-      <p class="sub">Sign-in is via Google Workspace. This list controls who sees the admin-only pages (GEO Reference, Admin Management).</p>
+      <p class="sub">Sign-in is the Google account viewing the page. This list controls who sees the admin-only pages (GEO Reference + Admin Management).</p>
       <div class="row">
-        <input id="adminEmail" placeholder="user@company.com" class="search">
+        <input id="adminEmail" placeholder="user@company.com" class="search" style="margin:0; flex:1; min-width:240px;">
         <button class="primary" id="adminAdd">Add admin</button>
       </div>
-      <div id="adminList" class="list"></div>
+      <div id="adminList" class="list" style="margin-top:16px"></div>
       <div class="status" id="adminStatus"></div>
     </div>
   </template>
@@ -122,23 +142,21 @@
   <template id="tpl-about">
     <div class="card">
       <h2>About this app</h2>
-      <p>NAP Data Converter — Google Apps Script port of the original Streamlit tool. Built so the workflow lives entirely inside Google Workspace (Sites + Apps Script + Sheets + Drive).</p>
+      <p class="sub">Google Apps Script port of the original Streamlit tool. Built to live entirely inside Google Workspace (Sites + Apps Script + Sheets + Drive).</p>
       <h3>Output columns</h3>
       <ol class="cols"></ol>
       <h3>Lookup spreadsheet tabs</h3>
       <ul>
-        <li><code>ADMINS</code> — who sees admin pages</li>
-        <li><code>MASTER</code> — optional NAP-ID override layer</li>
-        <li><code>PLA_BY_CABINET</code> — PLA ID + Tech by cabinet</li>
-        <li><code>AREA_BY_PREFIX</code> — Sales Area / Province / Territory by NAP-ID prefix</li>
+        <li><code>ADMINS</code> — controls who sees admin pages</li>
         <li><code>GEO_REFERENCE</code> — City / Barangay / Location Tagging by NAP ID</li>
         <li><code>NAP_DATA</code> — saved daily snapshots</li>
         <li><code>SNAPSHOT_INDEX</code> — index of snapshots for the History page</li>
       </ul>
+      <p class="sub">PLA ID, Tech, Sales Area, Province, and Territory are derived from the NAP ID / Cabinet using the same dictionaries as the Python script. Update <code>Lookups.gs</code> in the Apps Script editor when a new cabinet or prefix appears.</p>
       <h3>Known limits</h3>
       <ul>
-        <li>Apps Script hard cap: <strong>6 minutes</strong> per execution. Very large CSVs may not finish.</li>
-        <li>Google Sheets cap: <strong>10M cells per spreadsheet</strong>. At ~25k rows × 19 cols, NAP_DATA fills up in roughly 20 daily snapshots — rotate or archive monthly.</li>
+        <li>Apps Script cap: <strong>6 minutes</strong> per execution. Very large CSVs may not finish.</li>
+        <li>Google Sheets cap: <strong>10M cells per spreadsheet</strong>. NAP_DATA fills up in ~20 daily snapshots — rotate or archive monthly.</li>
         <li>Login is the Google account viewing the page. No bcrypt logins.</li>
       </ul>
     </div>

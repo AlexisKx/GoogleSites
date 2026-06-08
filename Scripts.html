@@ -1,15 +1,14 @@
 <script>
   /* eslint-disable */
   const PAGES = [
-    { id: 'converter', label: '📡 Converter', admin: false },
-    { id: 'history',   label: '🕓 Data History', admin: false },
-    { id: 'geo',       label: '📁 GEO Reference', admin: true },
-    { id: 'admins',    label: '👥 Admin Management', admin: true },
-    { id: 'about',     label: 'ℹ️ About', admin: false }
+    { id: 'converter', label: '📡 Converter',       admin: false, title: 'Converter',         desc: 'Upload a NAP CSV, get a cleaned Excel back, and save a dated snapshot.' },
+    { id: 'history',   label: '🕓 Data History',    admin: false, title: 'Data history',      desc: 'Every saved snapshot is here. Rebuild the Excel for any day.' },
+    { id: 'geo',       label: '📁 GEO Reference',   admin: true,  title: 'GEO reference',     desc: 'Manage City / Barangay / Location Tagging by NAP ID.' },
+    { id: 'admins',    label: '👥 Admin Management', admin: true, title: 'Admin management', desc: 'Control who has access to admin-only pages.' },
+    { id: 'about',     label: 'ℹ️ About',            admin: false, title: 'About',             desc: 'How the converter works and what its limits are.' }
   ];
 
   let session = { email: '', isAdmin: false };
-  let lastResult = null;
   let bulkPayload = null;
 
   function call(fn, ...args) {
@@ -26,6 +25,7 @@
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
   function fmtNum(n) { return Number(n || 0).toLocaleString(); }
+  function todayISO() { return new Date().toISOString().slice(0, 10); }
 
   function setPage(id) {
     location.hash = id;
@@ -48,16 +48,27 @@
     $('#me').innerHTML = session.email
       ? `<strong>${esc(session.email)}</strong>${session.isAdmin ? 'Admin' : 'User'}`
       : `<em>Not signed in</em>`;
+
+    const up = $('#userPill');
+    if (session.email) {
+      up.style.display = 'inline-flex';
+      up.innerHTML = `👤 ${esc(session.email)}${session.isAdmin ? ' · Admin' : ''}`;
+    } else {
+      up.style.display = 'none';
+    }
+    $('#todayPill').textContent = 'Today · ' + new Date().toLocaleDateString();
   }
 
   function render(id) {
     const page = PAGES.find(p => p.id === id) || PAGES[0];
     if (page.admin && !session.isAdmin) {
       $('#pageTitle').textContent = 'Access denied';
+      $('#pageDesc').textContent = '';
       $('#view').innerHTML = `<div class="card"><p class="err">This page requires admin access.</p></div>`;
       return;
     }
-    $('#pageTitle').textContent = page.label.replace(/^[^ ]+ /, '');
+    $('#pageTitle').textContent = page.title;
+    $('#pageDesc').textContent = page.desc;
     const tpl = $('#tpl-' + id);
     $('#view').innerHTML = '';
     $('#view').appendChild(tpl.content.cloneNode(true));
@@ -67,8 +78,7 @@
 
   // -------------------- CONVERTER --------------------
   function initConverter() {
-    const today = new Date().toISOString().slice(0, 10);
-    $('#snapDate').value = today;
+    $('#snapDate').value = todayISO();
     let csvText = null;
 
     $('#file').addEventListener('change', e => {
@@ -86,7 +96,6 @@
       $('#status').innerHTML = '⏳ Processing… large files can take a while.';
       try {
         const res = await call('processNapCsv', csvText, $('#snapDate').value);
-        lastResult = res;
         $('#status').innerHTML = '';
         $('#resultTabs').hidden = false;
         renderSummary(res);
@@ -105,13 +114,14 @@
   function renderSummary(res) {
     $('#paneSummary').innerHTML = `
       <div class="summary-stats">
-        <div class="stat"><div class="num">${fmtNum(res.read)}</div><div class="lbl">Rows read</div></div>
-        <div class="stat"><div class="num">${fmtNum(res.written)}</div><div class="lbl">Rows written</div></div>
-        <div class="stat"><div class="num">${fmtNum(res.skipped)}</div><div class="lbl">Rows skipped</div></div>
+        <div class="stat read"><div class="lbl">Rows read</div><div class="num">${fmtNum(res.read)}</div></div>
+        <div class="stat written"><div class="lbl">Rows written</div><div class="num">${fmtNum(res.written)}</div></div>
+        <div class="stat skipped"><div class="lbl">Rows skipped</div><div class="num">${fmtNum(res.skipped)}</div></div>
+        <div class="stat"><div class="lbl">Snapshot date</div><div class="num" style="font-size:18px">${esc(res.snapshotDate)}</div></div>
       </div>
       <div class="ok">✅ Saved snapshot ${esc(res.snapshotDate)}</div>
       <a class="dl" href="${esc(res.downloadUrl)}" target="_blank">⬇️ Download Excel</a>
-      <div class="meta">Also saved in Drive under "NAP Converter Output".</div>`;
+      <div class="meta">Also saved to Drive under <code>NAP Converter Output</code>.</div>`;
   }
 
   function renderPreview(res) {
@@ -120,26 +130,31 @@
     const head = cols.map(c => `<th>${esc(c)}</th>`).join('');
     const body = res.preview.map(r =>
       '<tr>' + cols.map(c => `<td>${esc(r[c])}</td>`).join('') + '</tr>').join('');
-    $('#panePreview').innerHTML = `<div class="scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+    $('#panePreview').innerHTML =
+      `<div class="scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
   }
 
   function renderMissing(res) {
     const m = res.missing;
     if (!m.length) {
-      $('#paneMissing').innerHTML = '<p class="ok">No missing-location records. 🎉</p>';
+      $('#paneMissing').innerHTML = '<p class="ok">✅ No missing-location records. 🎉</p>';
       return;
     }
     const rows = m.map(r => `<tr>
-        <td>${esc(r.napId)}</td>
-        <td>${r.city ? '✅ ' + esc(r.city) : '❌'}</td>
-        <td>${r.brgy ? '✅ ' + esc(r.brgy) : '❌'}</td>
-        <td>${r.location ? '✅ ' + esc(r.location) : '❌'}</td>
+        <td><strong>${esc(r.napId)}</strong></td>
+        <td>${r.city ? '<span class="chip ok">✓ ' + esc(r.city) + '</span>' : '<span class="chip err">missing</span>'}</td>
+        <td>${r.brgy ? '<span class="chip ok">✓ ' + esc(r.brgy) + '</span>' : '<span class="chip err">missing</span>'}</td>
+        <td>${r.location ? '<span class="chip ok">✓ ' + esc(r.location) + '</span>' : '<span class="chip err">missing</span>'}</td>
       </tr>`).join('');
     $('#paneMissing').innerHTML = `
       <div class="warn">⚠️ ${fmtNum(m.length)} record(s) missing City / Barangay / Location Tagging.</div>
-      <button class="primary" id="dlMissing" style="margin:10px 0">⬇️ Download Missing as Excel</button>
+      <div class="actions">
+        <button class="primary" id="dlMissing">⬇️ Download Missing as Excel</button>
+      </div>
       <div id="missingStatus" class="status"></div>
-      <div class="scroll"><table><thead><tr><th>NAP ID</th><th>City</th><th>Barangay</th><th>Location Tagging</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      <div class="scroll" style="margin-top:14px">
+        <table><thead><tr><th>NAP ID</th><th>City</th><th>Barangay</th><th>Location Tagging</th></tr></thead><tbody>${rows}</tbody></table>
+      </div>`;
     $('#dlMissing').onclick = async () => {
       $('#dlMissing').disabled = true;
       $('#missingStatus').innerHTML = '⏳ Building Excel…';
@@ -210,6 +225,7 @@
       try {
         const r = await call('upsertGeo', entry);
         $('#geoStatus').innerHTML = `<div class="ok">✅ ${esc(r.action)} ${esc(r.napId)}</div>`;
+        refreshGeoList();
       } catch (err) {
         $('#geoStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
       }
@@ -239,6 +255,7 @@
         const r = await call('deleteGeo', napId);
         $('#geoStatus').innerHTML = r.deleted
           ? `<div class="ok">🗑️ Deleted.</div>` : '<div class="warn">Not found.</div>';
+        refreshGeoList();
       } catch (err) {
         $('#geoStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
       }
@@ -275,14 +292,17 @@
   }
 
   async function refreshGeoList() {
+    if (!$('#geoList')) return;
     try {
-      const list = await call('listGeo', $('#geoSearch').value);
+      const list = await call('listGeo', $('#geoSearch') ? $('#geoSearch').value : '');
       if (!list.length) { $('#geoList').innerHTML = '<p class="sub">No entries.</p>'; return; }
       $('#geoList').innerHTML = `<div class="scroll"><table><thead><tr>
         <th>NAP ID</th><th>City</th><th>Barangay</th><th>Location Tagging</th><th>Updated</th></tr></thead><tbody>
         ${list.map(r => `<tr>
-          <td>${esc(r.napId)}</td><td>${esc(r.city)}</td>
-          <td>${esc(r.brgy)}</td><td>${esc(r.location)}</td>
+          <td><strong>${esc(r.napId)}</strong></td>
+          <td>${esc(r.city)}</td>
+          <td>${esc(r.brgy)}</td>
+          <td>${esc(r.location)}</td>
           <td class="meta">${esc((r.updatedAt || '').slice(0, 10))} ${esc(r.updatedBy)}</td>
         </tr>`).join('')}</tbody></table></div>`;
     } catch (err) {
@@ -316,11 +336,13 @@
       const list = await call('listAdmins');
       $('#adminList').innerHTML = list.length
         ? list.map(a => `<div class="item">
-            <div><strong>${esc(a.email)}</strong>
-            <div class="meta">added ${esc((a.addedAt || '').slice(0, 10))} by ${esc(a.addedBy)}</div></div>
+            <div>
+              <strong>${esc(a.email)}</strong>
+              <div class="meta">added ${esc((a.addedAt || '').slice(0, 10))} by ${esc(a.addedBy)}</div>
+            </div>
             <button class="danger" data-email="${esc(a.email)}">Remove</button>
           </div>`).join('')
-        : '<p class="sub">No admins. Add one in the ADMINS tab of the lookup sheet directly to bootstrap.</p>';
+        : '<p class="sub">No admins yet. Add a row to the ADMINS tab of the lookup sheet to bootstrap.</p>';
       $$('#adminList button').forEach(b => {
         b.onclick = async () => {
           if (!confirm(`Remove admin ${b.dataset.email}?`)) return;
