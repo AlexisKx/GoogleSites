@@ -78,10 +78,29 @@
   // ============================================================
   // CONVERTER (all client-side)
   // ============================================================
-  const OUTPUT_COLS = ['Cabinet','NAP ID','Discovered When','PLA ID','Tech',
-    'Ports Assigned','Ports Reserved','Ports Total','UTILIZATION',
-    'Latitude','Longitude','SALES_AREA','TERRITORY','BRGY_NAME',
-    'CITY_NAME','PROVINCE_NAME','LOCATION TAGGING'];
+  // Column specs: [header (UPPERCASE), width, centered, numberFormat].
+  // Centered + narrower for the four port-related columns; UTILIZATION as percent.
+  const OUTPUT_COL_SPECS = [
+    ['CABINET',          24, false, null],
+    ['NAP ID',           22, false, null],
+    ['DISCOVERED WHEN',  22, false, null],
+    ['PLA ID',           12, false, null],
+    ['TECH',             14, false, null],
+    ['PORTS ASSIGNED',   16, true,  null],
+    ['PORTS RESERVED',   16, true,  null],
+    ['PORTS TOTAL',      13, true,  null],
+    ['UTILIZATION',      13, true,  '0%'],
+    ['LATITUDE',         18, false, null],
+    ['LONGITUDE',        18, false, null],
+    ['SALES_AREA',       16, false, null],
+    ['TERRITORY',        16, false, null],
+    ['BRGY_NAME',        22, false, null],
+    ['CITY_NAME',        22, false, null],
+    ['PROVINCE_NAME',    22, false, null],
+    ['LOCATION TAGGING', 24, false, null]
+  ];
+  const OUTPUT_COLS = OUTPUT_COL_SPECS.map(s => s[0]);
+  const HEADER_FILL_ARGB = 'FFD9EAD3';   // light green
 
   const TRAILING_COLS = 12;
   const JUNK_PATTERNS = [
@@ -242,7 +261,7 @@
 
         setProgress(98, 'Writing Excel file…');
         await tick();
-        const blob = buildXlsxBlob(res.rows);
+        const blob = await buildXlsxBlob(res.rows);
         const url = URL.createObjectURL(blob);
         setProgress(100, 'Done.');
         setTimeout(hideProgress, 800);
@@ -361,25 +380,63 @@
     return { rows, missing, read: readCount, skipped, written: rows.length, duration: performance.now() - started };
   }
 
-  function buildXlsxBlob(rows) {
-    const data = [OUTPUT_COLS].concat(rows);
-    const ws = XLSX.utils.aoa_to_sheet(data);
-    ws['!cols'] = OUTPUT_COLS.map(() => ({ wch: 21 }));
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'NAP Data');
-    const ab = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
-    return new Blob([ab], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  // Apply the shared header treatment: bold, light green fill, centered.
+  function styleHeaderRow_(ws) {
+    const hdr = ws.getRow(1);
+    hdr.height = 22;
+    hdr.eachCell(cell => {
+      cell.font = { bold: true };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: HEADER_FILL_ARGB } };
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      cell.border = {
+        bottom: { style: 'thin', color: { argb: 'FFB5C8A8' } }
+      };
+    });
   }
 
-  function buildMissingXlsxBlob(missing) {
-    const headers = ['NAP ID', 'CITY_NAME', 'BRGY_NAME', 'LOCATION TAGGING'];
-    const data = [headers].concat(missing.map(m => [m.napId, m.city || '', m.brgy || '', m.location || '']));
-    const ws = XLSX.utils.aoa_to_sheet(data);
-    ws['!cols'] = [{ wch: 22 }, { wch: 24 }, { wch: 24 }, { wch: 24 }];
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Missing Location');
-    const ab = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
-    return new Blob([ab], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  async function buildXlsxBlob(rows) {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('NAP Data');
+
+    // Define columns first so column-level styles apply to all cells.
+    ws.columns = OUTPUT_COL_SPECS.map(([header, width, center, numFmt]) => ({
+      header: header,
+      width:  width,
+      style: {
+        alignment: center ? { horizontal: 'center', vertical: 'middle' } : undefined,
+        numFmt:    numFmt || undefined
+      }
+    }));
+
+    if (rows.length) ws.addRows(rows);
+
+    styleHeaderRow_(ws);
+    ws.views = [{ state: 'frozen', ySplit: 1 }];
+
+    const buffer = await wb.xlsx.writeBuffer();
+    return new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  }
+
+  async function buildMissingXlsxBlob(missing) {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Missing Location');
+
+    ws.columns = [
+      { header: 'NAP ID',           width: 22 },
+      { header: 'CITY_NAME',        width: 24 },
+      { header: 'BRGY_NAME',        width: 24 },
+      { header: 'LOCATION TAGGING', width: 26 }
+    ];
+
+    if (missing.length) {
+      ws.addRows(missing.map(m => [m.napId, m.city || '', m.brgy || '', m.location || '']));
+    }
+
+    styleHeaderRow_(ws);
+    ws.views = [{ state: 'frozen', ySplit: 1 }];
+
+    const buffer = await wb.xlsx.writeBuffer();
+    return new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
   }
 
   function triggerDownload(blob, name) {
@@ -407,9 +464,20 @@
     if (!res.preview.length) {
       $('#panePreview').innerHTML = '<p class="sub">No rows.</p>';
     } else {
-      const head = OUTPUT_COLS.map(c => `<th>${esc(c)}</th>`).join('');
+      const CENTER_IDX = new Set([5, 6, 7, 8]);   // ports + utilization
+      const UTIL_IDX = 8;
+      const head = OUTPUT_COLS.map((c, i) => {
+        const cls = CENTER_IDX.has(i) ? ' style="text-align:center"' : '';
+        return `<th${cls}>${esc(c)}</th>`;
+      }).join('');
       const body = res.preview.map(r =>
-        '<tr>' + r.map(v => `<td>${esc(v)}</td>`).join('') + '</tr>').join('');
+        '<tr>' + r.map((v, i) => {
+          let display;
+          if (i === UTIL_IDX && typeof v === 'number') display = Math.round(v * 100) + '%';
+          else display = esc(v);
+          const cls = CENTER_IDX.has(i) ? ' style="text-align:center"' : '';
+          return `<td${cls}>${display}</td>`;
+        }).join('') + '</tr>').join('');
       $('#panePreview').innerHTML =
         `<div class="scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
     }
@@ -436,9 +504,14 @@
         <div class="scroll" style="margin-top:14px">
           <table><thead><tr><th>NAP ID</th><th>City</th><th>Barangay</th><th>Location Tagging</th></tr></thead><tbody>${rows}</tbody></table>
         </div>`;
-      $('#dlMissing').onclick = () => {
-        const blob = buildMissingXlsxBlob(res.missing);
-        triggerDownload(blob, `missing_location_${res.snapshotDate}.xlsx`);
+      $('#dlMissing').onclick = async () => {
+        $('#dlMissing').disabled = true;
+        try {
+          const blob = await buildMissingXlsxBlob(res.missing);
+          triggerDownload(blob, `missing_location_${res.snapshotDate}.xlsx`);
+        } finally {
+          $('#dlMissing').disabled = false;
+        }
       };
     }
 
@@ -516,19 +589,39 @@
       $('#bulkStatus').innerHTML = '⏳ Parsing Excel…';
       try {
         const buf = await f.arrayBuffer();
-        const wb = XLSX.read(buf, { type: 'array' });
-        const sh = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(sh, { defval: '' });
-        const norm = rows.map(r => {
-          const obj = {};
-          for (const k in r) obj[String(k).trim().toUpperCase()] = r[k];
-          return {
-            napId:    String(obj['NAP ID'] || '').trim(),
-            city:     String(obj['CITY_NAME'] || '').trim(),
-            brgy:     String(obj['BRGY_NAME'] || '').trim(),
-            location: String(obj['LOCATION TAGGING'] || '').trim()
-          };
-        }).filter(r => r.napId);
+        const wb = new ExcelJS.Workbook();
+        await wb.xlsx.load(buf);
+        const ws = wb.worksheets[0];
+        if (!ws) throw new Error('No sheet found.');
+
+        // Build header → column-number map from row 1.
+        const headerMap = {};
+        ws.getRow(1).eachCell({ includeEmpty: false }, (cell, colNumber) => {
+          headerMap[String(cell.value || '').trim().toUpperCase()] = colNumber;
+        });
+        const need = ['NAP ID', 'CITY_NAME', 'BRGY_NAME', 'LOCATION TAGGING'];
+        for (const n of need) if (!headerMap[n]) throw new Error('Missing column: ' + n);
+
+        const cellVal = (row, col) => {
+          const v = row.getCell(col).value;
+          if (v == null) return '';
+          if (typeof v === 'object' && 'text' in v) return String(v.text).trim();   // rich text
+          if (typeof v === 'object' && 'result' in v) return String(v.result).trim(); // formula
+          return String(v).trim();
+        };
+
+        const norm = [];
+        for (let r = 2; r <= ws.rowCount; r++) {
+          const row = ws.getRow(r);
+          const napId = cellVal(row, headerMap['NAP ID']);
+          if (!napId) continue;
+          norm.push({
+            napId:    napId,
+            city:     cellVal(row, headerMap['CITY_NAME']),
+            brgy:     cellVal(row, headerMap['BRGY_NAME']),
+            location: cellVal(row, headerMap['LOCATION TAGGING'])
+          });
+        }
         if (!norm.length) throw new Error('No rows with a NAP ID column.');
         bulkPayload = norm;
         $('#bulkStatus').innerHTML = `<div class="ok">Found ${fmtNum(norm.length)} row(s). Click Upload to send.</div>`;
