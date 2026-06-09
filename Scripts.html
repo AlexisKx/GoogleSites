@@ -4,11 +4,13 @@
   // ============================================================
   // Pages
   // ============================================================
+  // Everyone in the ADMINS sheet sees every page. Anyone else sees
+  // the Access Denied screen before any of these load.
   const PAGES = [
-    { id: 'converter', label: '📡 Converter',        admin: false, title: 'Converter',         desc: 'Upload a NAP CSV, get a cleaned Excel back. All processing runs in your browser — no server limits.' },
-    { id: 'geo',       label: '📁 GEO Reference',    admin: true,  title: 'GEO reference',     desc: 'Manage City / Barangay / Location Tagging by NAP ID.' },
-    { id: 'admins',    label: '👥 Admin Management', admin: true,  title: 'Admin management',  desc: 'Control who has access to admin-only pages.' },
-    { id: 'about',     label: 'ℹ️ About',             admin: false, title: 'About',             desc: 'How the converter works and what its limits are.' }
+    { id: 'converter', label: '📡 Converter',         title: 'Converter',         desc: 'Upload a NAP CSV, get a cleaned Excel back. All processing runs in your browser — no server limits.' },
+    { id: 'geo',       label: '📁 GEO Reference',     title: 'GEO reference',     desc: 'Manage City / Barangay / Location Tagging by NAP ID.' },
+    { id: 'admins',    label: '👥 Authorized Users',  title: 'Authorized users',  desc: 'Control who can access this app. Add a Google email to grant access; remove to revoke.' },
+    { id: 'about',     label: 'ℹ️ About',              title: 'About',             desc: 'How the converter works and what its limits are.' }
   ];
 
   let session = { email: '', isAdmin: false };
@@ -41,7 +43,6 @@
     const nav = $('#nav'); nav.innerHTML = '';
     const current = (location.hash || '#converter').slice(1);
     PAGES.forEach(p => {
-      if (p.admin && !session.isAdmin) return;
       const a = document.createElement('a');
       a.textContent = p.label;
       a.className = (p.id === current ? 'active' : '');
@@ -49,30 +50,43 @@
       nav.appendChild(a);
     });
     $('#me').innerHTML = session.email
-      ? `<strong>${esc(session.email)}</strong>${session.isAdmin ? 'Admin' : 'User'}`
+      ? `<strong>${esc(session.email)}</strong>Authorized`
       : `<em>Not signed in</em>`;
     const up = $('#userPill');
     if (session.email) {
       up.style.display = 'inline-flex';
-      up.innerHTML = `👤 ${esc(session.email)}${session.isAdmin ? ' · Admin' : ''}`;
+      up.innerHTML = `👤 ${esc(session.email)}`;
     } else up.style.display = 'none';
     $('#todayPill').textContent = 'Today · ' + new Date().toLocaleDateString();
   }
 
   function render(id) {
     const page = PAGES.find(p => p.id === id) || PAGES[0];
-    if (page.admin && !session.isAdmin) {
-      $('#pageTitle').textContent = 'Access denied';
-      $('#pageDesc').textContent = '';
-      $('#view').innerHTML = `<div class="card"><p class="err">This page requires admin access.</p></div>`;
-      return;
-    }
     $('#pageTitle').textContent = page.title;
     $('#pageDesc').textContent = page.desc;
     const tpl = $('#tpl-' + id);
     $('#view').innerHTML = '';
     $('#view').appendChild(tpl.content.cloneNode(true));
     ({ converter: initConverter, geo: initGeo, admins: initAdmins, about: initAbout })[id]();
+  }
+
+  function renderAccessDenied(email) {
+    // Hide the sidebar and replace the entire app with a single card.
+    $('#app').innerHTML = `
+      <main class="main" style="flex:1">
+        <div class="card" style="max-width:560px; margin:40px auto">
+          <h2>🔒 Access required</h2>
+          <p class="sub">You're signed in as <strong>${esc(email || '(no Google account detected)')}</strong>, but this account isn't authorized to use the NAP Data Converter.</p>
+          <p class="sub">Ask the administrator to add your email to the allowlist, or sign in with a different Google account.</p>
+          <div class="actions">
+            <a class="dl" href="https://accounts.google.com/Logout" target="_blank" rel="noopener">Sign out of Google</a>
+            <button class="ghost" onclick="location.reload()">Try again</button>
+          </div>
+          <p class="meta" style="margin-top:18px">After signing out, return to this page and sign back in with the authorized account.</p>
+        </div>
+      </main>`;
+    $('#userPill').style.display = 'none';
+    $('#todayPill').textContent = 'Access required';
   }
 
   // ============================================================
@@ -689,7 +703,10 @@
       if (!email) return;
       try {
         const r = await call('addAdmin', email);
-        $('#adminStatus').innerHTML = `<div class="ok">${esc(r.action)} ${esc(r.email)}</div>`;
+        const msg = r.action === 'exists'
+          ? `${esc(r.email)} already has access.`
+          : `✅ Access granted to ${esc(r.email)}.`;
+        $('#adminStatus').innerHTML = `<div class="ok">${msg}</div>`;
         $('#adminEmail').value = '';
         refreshAdmins();
       } catch (err) {
@@ -708,12 +725,12 @@
               <strong>${esc(a.email)}</strong>
               <div class="meta">added ${esc((a.addedAt || '').slice(0,10))} by ${esc(a.addedBy)}</div>
             </div>
-            <button class="danger" data-email="${esc(a.email)}">Remove</button>
+            <button class="danger" data-email="${esc(a.email)}">Revoke</button>
           </div>`).join('')
-        : '<p class="sub">No admins yet. Add a row to the ADMINS tab of the lookup sheet to bootstrap.</p>';
+        : '<p class="sub">No authorized users yet. Add a row to the ADMINS tab of the lookup sheet to bootstrap.</p>';
       $$('#adminList button').forEach(b => {
         b.onclick = async () => {
-          if (!confirm(`Remove admin ${b.dataset.email}?`)) return;
+          if (!confirm(`Revoke access for ${b.dataset.email}?`)) return;
           try { await call('removeAdmin', b.dataset.email); refreshAdmins(); }
           catch (err) { alert(err.message || err); }
         };
@@ -736,8 +753,15 @@
   (async function boot() {
     try { session = await call('getSession'); }
     catch (e) { session = { email: '', isAdmin: false }; }
+
+    // Single allowlist: ADMINS tab. Not on it → can't use the app.
+    if (!session.isAdmin) {
+      renderAccessDenied(session.email);
+      return;
+    }
+
     const initial = (location.hash || '#converter').slice(1);
-    const allowed = PAGES.find(p => p.id === initial && (!p.admin || session.isAdmin));
+    const allowed = PAGES.find(p => p.id === initial);
     setPage(allowed ? initial : 'converter');
     window.addEventListener('hashchange', () => render((location.hash || '#converter').slice(1)));
   })();

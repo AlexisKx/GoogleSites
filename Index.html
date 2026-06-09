@@ -128,11 +128,11 @@
 
   <template id="tpl-admins">
     <div class="card">
-      <h2>Admin management</h2>
-      <p class="sub">Sign-in is the Google account viewing the page. This list controls who sees the admin-only pages (GEO Reference + Admin Management).</p>
+      <h2>Authorized users</h2>
+      <p class="sub">Anyone on this list can access the NAP Data Converter (with the Google account whose email is listed). Anyone not on the list sees the Access Required screen. Add a supervisor or teammate's Google email below to grant access.</p>
       <div class="row">
-        <input id="adminEmail" placeholder="user@company.com" class="search" style="margin:0; flex:1; min-width:240px;">
-        <button class="primary" id="adminAdd">Add admin</button>
+        <input id="adminEmail" placeholder="supervisor@company.com" class="search" style="margin:0; flex:1; min-width:240px;">
+        <button class="primary" id="adminAdd">Grant access</button>
       </div>
       <div id="adminList" class="list" style="margin-top:16px"></div>
       <div class="status" id="adminStatus"></div>

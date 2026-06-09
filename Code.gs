@@ -87,7 +87,7 @@ function openLookupSheet_() {
 // Returns the entire GEO_REFERENCE as { napId: [city, brgy, loc] }.
 // Cached server-side for 5 minutes. The browser caches it for the session.
 function getGeoData() {
-  getSession();
+  requireAdmin_();    // ADMINS tab is the full-access allowlist
   const cache = CacheService.getScriptCache();
   const cached = cache.get('geo_v2');
   if (cached) { try { return JSON.parse(cached); } catch (e) {} }
