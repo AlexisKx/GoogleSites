@@ -2,25 +2,27 @@
   /* eslint-disable */
 
   // ============================================================
-  // Pages
+  // State
   // ============================================================
-  // Everyone in the ADMINS sheet sees every page. Anyone else sees
-  // the Access Denied screen before any of these load.
+  const TOKEN_KEY = 'nap_token_v1';
+  let session = null;   // { token, username, isAdmin }
+
+  // Pages once authenticated. `admin: true` → only admins see it.
   const PAGES = [
-    { id: 'converter', label: '📡 Converter',         title: 'Converter',         desc: 'Upload a NAP CSV, get a cleaned Excel back. All processing runs in your browser — no server limits.' },
-    { id: 'geo',       label: '📁 GEO Reference',     title: 'GEO reference',     desc: 'Manage City / Barangay / Location Tagging by NAP ID.' },
-    { id: 'admins',    label: '👥 Authorized Users',  title: 'Authorized users',  desc: 'Control who can access this app. Add a Google email to grant access; remove to revoke.' },
-    { id: 'about',     label: 'ℹ️ About',              title: 'About',             desc: 'How the converter works and what its limits are.' }
+    { id: 'converter', label: '📡 Converter',        admin: false, title: 'Converter',         desc: 'Upload a NAP CSV, get a cleaned Excel back. All processing runs in your browser — no server limits.' },
+    { id: 'geo',       label: '📁 GEO Reference',    admin: true,  title: 'GEO reference',     desc: 'Manage City / Barangay / Location Tagging by NAP ID.' },
+    { id: 'users',     label: '👥 Users',            admin: true,  title: 'Users',             desc: 'Manage who can sign in to this app.' },
+    { id: 'password',  label: '🔒 Change Password', admin: false, title: 'Change password',   desc: 'Update your own password.' },
+    { id: 'about',     label: 'ℹ️ About',             admin: false, title: 'About',             desc: 'How the converter works and what its limits are.' }
   ];
 
-  let session = { email: '', isAdmin: false };
-  let geoData = null;            // {napId: [city, brgy, loc]}
-  let bulkPayload = null;        // parsed rows ready to upload
+  let geoData = null;
+  let bulkPayload = null;
 
   // ============================================================
   // Boilerplate
   // ============================================================
-  function call(fn, ...args) {
+  function callRaw(fn, ...args) {
     return new Promise((resolve, reject) => {
       google.script.run
         .withSuccessHandler(resolve)
@@ -28,6 +30,27 @@
         [fn](...args);
     });
   }
+  // call() automatically passes the session token as the first arg.
+  function call(fn, ...args) {
+    if (!session || !session.token) {
+      return Promise.reject(new Error('Not signed in.'));
+    }
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(err => {
+          // Auto-logout on session-expired error.
+          const msg = (err && err.message) || String(err);
+          if (/session has expired/i.test(msg) || /not signed in/i.test(msg)) {
+            clearSession();
+            showLogin('Your session expired. Please sign in again.');
+          }
+          reject(err);
+        })
+        [fn](session.token, ...args);
+    });
+  }
+
   const $  = (sel, root) => (root || document).querySelector(sel);
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c =>
@@ -37,63 +60,138 @@
   const fmtBytes = b => b > 1048576 ? (b/1048576).toFixed(1) + ' MB' : (b/1024).toFixed(1) + ' KB';
   const fmtDuration = ms => ms < 1000 ? ms + ' ms' : (ms/1000).toFixed(1) + ' s';
 
+  // ============================================================
+  // Auth UI
+  // ============================================================
+  function persistSession(sess) {
+    session = sess;
+    try { localStorage.setItem(TOKEN_KEY, JSON.stringify(sess)); } catch (e) {}
+  }
+  function clearSession() {
+    session = null;
+    try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+  }
+  function loadStoredSession() {
+    try {
+      const raw = localStorage.getItem(TOKEN_KEY);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (e) { return null; }
+  }
+
+  function showLogin(message) {
+    // Hide sidebar + nav, show login card.
+    $('#nav').innerHTML = '';
+    $('#me').innerHTML = '';
+    $('#userPill').style.display = 'none';
+    $('#logoutBtn').style.display = 'none';
+    $('#todayPill').textContent = 'Sign in to continue';
+    $('#pageTitle').textContent = 'Sign in';
+    $('#pageDesc').textContent  = 'Enter your username and password to access the NAP Data Converter.';
+
+    // Replace whole app with just the login card.
+    $('#app').innerHTML = `<main class="main" style="flex:1"></main>`;
+    const main = $('#app .main');
+    const tpl = $('#tpl-login');
+    main.appendChild(tpl.content.cloneNode(true));
+
+    if (message) $('#loginStatus').innerHTML = `<div class="warn">${esc(message)}</div>`;
+
+    const tryLogin = async () => {
+      const u = $('#loginUser').value.trim();
+      const p = $('#loginPass').value;
+      if (!u || !p) {
+        $('#loginStatus').innerHTML = '<div class="err">Enter your username and password.</div>';
+        return;
+      }
+      $('#loginGo').disabled = true;
+      $('#loginStatus').innerHTML = '⏳ Signing in…';
+      try {
+        const res = await callRaw('login', u, p);
+        persistSession({ token: res.token, username: res.username, isAdmin: res.isAdmin });
+        location.hash = 'converter';
+        mountApp();
+      } catch (err) {
+        $('#loginStatus').innerHTML = `<div class="err">❌ ${esc(err.message || err)}</div>`;
+      } finally {
+        $('#loginGo').disabled = false;
+      }
+    };
+    $('#loginGo').onclick = tryLogin;
+    $('#loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') tryLogin(); });
+    $('#loginUser').focus();
+  }
+
+  // ============================================================
+  // App shell
+  // ============================================================
+  function mountApp() {
+    // Rebuild full app shell (sidebar + main).
+    $('#app').innerHTML = `
+      <aside class="sidebar">
+        <nav id="nav"></nav>
+        <div class="me" id="me"></div>
+      </aside>
+      <main class="main">
+        <div class="page-head">
+          <h2 id="pageTitle">Converter</h2>
+          <div class="desc" id="pageDesc"></div>
+        </div>
+        <section id="view" class="view"></section>
+      </main>`;
+    $('#logoutBtn').style.display = 'inline-flex';
+    $('#logoutBtn').onclick = doLogout;
+
+    renderNav();
+    const initial = (location.hash || '#converter').slice(1);
+    const allowed = PAGES.find(p => p.id === initial && (!p.admin || session.isAdmin));
+    setPage(allowed ? initial : 'converter');
+  }
+
+  async function doLogout() {
+    try { if (session && session.token) await callRaw('logout', session.token); } catch (e) {}
+    clearSession();
+    showLogin('Signed out. Sign in to continue.');
+  }
+
   function setPage(id) { location.hash = id; renderNav(); render(id); }
 
   function renderNav() {
     const nav = $('#nav'); nav.innerHTML = '';
     const current = (location.hash || '#converter').slice(1);
     PAGES.forEach(p => {
+      if (p.admin && !session.isAdmin) return;
       const a = document.createElement('a');
       a.textContent = p.label;
       a.className = (p.id === current ? 'active' : '');
       a.onclick = () => setPage(p.id);
       nav.appendChild(a);
     });
-    $('#me').innerHTML = session.email
-      ? `<strong>${esc(session.email)}</strong>Authorized`
-      : `<em>Not signed in</em>`;
-    const up = $('#userPill');
-    if (session.email) {
-      up.style.display = 'inline-flex';
-      up.innerHTML = `👤 ${esc(session.email)}`;
-    } else up.style.display = 'none';
+    $('#me').innerHTML = `<strong>${esc(session.username)}</strong>${session.isAdmin ? 'Admin' : 'User'}`;
+    $('#userPill').style.display = 'inline-flex';
+    $('#userPill').innerHTML = `👤 ${esc(session.username)}${session.isAdmin ? ' · Admin' : ''}`;
     $('#todayPill').textContent = 'Today · ' + new Date().toLocaleDateString();
   }
 
   function render(id) {
     const page = PAGES.find(p => p.id === id) || PAGES[0];
+    if (page.admin && !session.isAdmin) {
+      $('#pageTitle').textContent = 'Access denied';
+      $('#pageDesc').textContent = '';
+      $('#view').innerHTML = `<div class="card"><p class="err">This page requires admin access.</p></div>`;
+      return;
+    }
     $('#pageTitle').textContent = page.title;
     $('#pageDesc').textContent = page.desc;
     const tpl = $('#tpl-' + id);
     $('#view').innerHTML = '';
     $('#view').appendChild(tpl.content.cloneNode(true));
-    ({ converter: initConverter, geo: initGeo, admins: initAdmins, about: initAbout })[id]();
-  }
-
-  function renderAccessDenied(email) {
-    // Hide the sidebar and replace the entire app with a single card.
-    $('#app').innerHTML = `
-      <main class="main" style="flex:1">
-        <div class="card" style="max-width:560px; margin:40px auto">
-          <h2>🔒 Access required</h2>
-          <p class="sub">You're signed in as <strong>${esc(email || '(no Google account detected)')}</strong>, but this account isn't authorized to use the NAP Data Converter.</p>
-          <p class="sub">Ask the administrator to add your email to the allowlist, or sign in with a different Google account.</p>
-          <div class="actions">
-            <a class="dl" href="https://accounts.google.com/Logout" target="_blank" rel="noopener">Sign out of Google</a>
-            <button class="ghost" onclick="location.reload()">Try again</button>
-          </div>
-          <p class="meta" style="margin-top:18px">After signing out, return to this page and sign back in with the authorized account.</p>
-        </div>
-      </main>`;
-    $('#userPill').style.display = 'none';
-    $('#todayPill').textContent = 'Access required';
+    ({ converter: initConverter, geo: initGeo, users: initUsers, password: initPassword, about: initAbout })[id]();
   }
 
   // ============================================================
-  // CONVERTER (all client-side)
+  // CONVERTER (all client-side, same as before)
   // ============================================================
-  // Column specs: [header (UPPERCASE), width, centered, numberFormat].
-  // Centered + narrower for the four port-related columns; UTILIZATION as percent.
   const OUTPUT_COL_SPECS = [
     ['CABINET',          24, false, null],
     ['NAP ID',           22, false, null],
@@ -114,7 +212,7 @@
     ['LOCATION TAGGING', 24, false, null]
   ];
   const OUTPUT_COLS = OUTPUT_COL_SPECS.map(s => s[0]);
-  const HEADER_FILL_ARGB = 'FFD9EAD3';   // light green
+  const HEADER_FILL_ARGB = 'FFD9EAD3';
 
   const TRAILING_COLS = 12;
   const JUNK_PATTERNS = [
@@ -209,7 +307,6 @@
     return Math.round((a / t) * 10000) / 10000;
   }
 
-  // ----- Streaming line reader -----
   async function* readLines(file, onByteProgress) {
     const reader = file.stream().pipeThrough(new TextDecoderStream('utf-8', { fatal: false })).getReader();
     let buf = '';
@@ -241,11 +338,8 @@
     if (text != null) $('#progressText').textContent = text;
   }
   function hideProgress() { $('#progressWrap').hidden = true; }
-
-  // Yield to the event loop so progress text repaints.
   const tick = () => new Promise(r => setTimeout(r, 0));
 
-  // ----- Converter init -----
   function initConverter() {
     $('#snapDate').value = todayISO();
     let pickedFile = null;
@@ -297,7 +391,6 @@
     });
   }
 
-  // ----- Pipeline -----
   async function convertFile(file, geo) {
     const started = performance.now();
     const totalBytes = file.size;
@@ -306,14 +399,13 @@
     const merged = new Map();
     const order = [];
 
-    // Pass 1: read + parse + filter + merge in one stream
     setProgress(3, 'Parsing CSV…');
     await tick();
     let lastTick = performance.now();
 
     for await (const raw of readLines(file, b => { bytesRead = b; })) {
       lineNum++;
-      if (lineNum === 1) continue;                      // header row
+      if (lineNum === 1) continue;
       if (!raw || !raw.replace(/;/g, '').trim()) continue;
       if (isJunkRow(raw)) continue;
       readCount++;
@@ -350,7 +442,6 @@
         else e.pt = pt + (isNaN(newPt) ? 0 : newPt);
       }
 
-      // progress + repaint every ~250ms
       if (performance.now() - lastTick > 250) {
         const bytePct = Math.min(80, 5 + (bytesRead / totalBytes) * 75);
         setProgress(bytePct, `Parsing… ${fmtNum(readCount)} rows · ${fmtBytes(bytesRead)} / ${fmtBytes(totalBytes)}`);
@@ -359,7 +450,6 @@
       }
     }
 
-    // Pass 2: build output rows
     setProgress(85, `Enriching ${fmtNum(order.length)} merged NAPs…`);
     await tick();
     const rows = new Array(order.length);
@@ -394,7 +484,6 @@
     return { rows, missing, read: readCount, skipped, written: rows.length, duration: performance.now() - started };
   }
 
-  // Apply the shared header treatment: bold, light green fill, centered.
   function styleHeaderRow_(ws) {
     const hdr = ws.getRow(1);
     hdr.height = 22;
@@ -402,31 +491,23 @@
       cell.font = { bold: true };
       cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: HEADER_FILL_ARGB } };
       cell.alignment = { horizontal: 'center', vertical: 'middle' };
-      cell.border = {
-        bottom: { style: 'thin', color: { argb: 'FFB5C8A8' } }
-      };
+      cell.border = { bottom: { style: 'thin', color: { argb: 'FFB5C8A8' } } };
     });
   }
 
   async function buildXlsxBlob(rows) {
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('NAP Data');
-
-    // Define columns first so column-level styles apply to all cells.
     ws.columns = OUTPUT_COL_SPECS.map(([header, width, center, numFmt]) => ({
-      header: header,
-      width:  width,
+      header: header, width: width,
       style: {
         alignment: center ? { horizontal: 'center', vertical: 'middle' } : undefined,
         numFmt:    numFmt || undefined
       }
     }));
-
     if (rows.length) ws.addRows(rows);
-
     styleHeaderRow_(ws);
     ws.views = [{ state: 'frozen', ySplit: 1 }];
-
     const buffer = await wb.xlsx.writeBuffer();
     return new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
   }
@@ -434,21 +515,17 @@
   async function buildMissingXlsxBlob(missing) {
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Missing Location');
-
     ws.columns = [
       { header: 'NAP ID',           width: 22 },
       { header: 'CITY_NAME',        width: 24 },
       { header: 'BRGY_NAME',        width: 24 },
       { header: 'LOCATION TAGGING', width: 26 }
     ];
-
     if (missing.length) {
       ws.addRows(missing.map(m => [m.napId, m.city || '', m.brgy || '', m.location || '']));
     }
-
     styleHeaderRow_(ws);
     ws.views = [{ state: 'frozen', ySplit: 1 }];
-
     const buffer = await wb.xlsx.writeBuffer();
     return new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
   }
@@ -474,11 +551,10 @@
       <a class="dl" id="dlMain" href="${esc(res.downloadUrl)}" download="${esc(res.downloadName)}">⬇️ Download Excel</a>
       <div class="meta">Report date label: <code>${esc(res.snapshotDate)}</code> · file: <code>${esc(res.downloadName)}</code></div>`;
 
-    // Preview tab
     if (!res.preview.length) {
       $('#panePreview').innerHTML = '<p class="sub">No rows.</p>';
     } else {
-      const CENTER_IDX = new Set([5, 6, 7, 8]);   // ports + utilization
+      const CENTER_IDX = new Set([5, 6, 7, 8]);
       const UTIL_IDX = 8;
       const head = OUTPUT_COLS.map((c, i) => {
         const cls = CENTER_IDX.has(i) ? ' style="text-align:center"' : '';
@@ -496,7 +572,6 @@
         `<div class="scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
     }
 
-    // Missing tab
     $('#missCount').textContent = res.missing.length;
     if (!res.missing.length) {
       $('#paneMissing').innerHTML = '<p class="ok">✅ No missing-location records. 🎉</p>';
@@ -544,7 +619,7 @@
   }
 
   // ============================================================
-  // GEO REFERENCE (admin)
+  // GEO (admin)
   // ============================================================
   function initGeo() {
     bindTabs($('#view .tabs'));
@@ -556,13 +631,12 @@
           brgy: $('#geoBrgy').value, location: $('#geoLoc').value
         });
         $('#geoStatus').innerHTML = `<div class="ok">✅ ${esc(r.action)} ${esc(r.napId)}</div>`;
-        geoData = null; // force re-fetch next conversion
+        geoData = null;
         refreshGeoList();
       } catch (err) {
         $('#geoStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
       }
     };
-
     $('#geoLoad').onclick = async () => {
       const napId = $('#geoNap').value.trim();
       if (!napId) return;
@@ -575,12 +649,10 @@
         $('#geoStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
       }
     };
-
     $('#geoClear').onclick = () => {
       ['#geoNap','#geoCity','#geoBrgy','#geoLoc'].forEach(s => $(s).value = '');
       $('#geoStatus').innerHTML = '';
     };
-
     $('#geoDel').onclick = async () => {
       const napId = $('#geoNap').value.trim();
       if (!napId) return;
@@ -607,30 +679,26 @@
         await wb.xlsx.load(buf);
         const ws = wb.worksheets[0];
         if (!ws) throw new Error('No sheet found.');
-
-        // Build header → column-number map from row 1.
         const headerMap = {};
         ws.getRow(1).eachCell({ includeEmpty: false }, (cell, colNumber) => {
           headerMap[String(cell.value || '').trim().toUpperCase()] = colNumber;
         });
         const need = ['NAP ID', 'CITY_NAME', 'BRGY_NAME', 'LOCATION TAGGING'];
         for (const n of need) if (!headerMap[n]) throw new Error('Missing column: ' + n);
-
         const cellVal = (row, col) => {
           const v = row.getCell(col).value;
           if (v == null) return '';
-          if (typeof v === 'object' && 'text' in v) return String(v.text).trim();   // rich text
-          if (typeof v === 'object' && 'result' in v) return String(v.result).trim(); // formula
+          if (typeof v === 'object' && 'text' in v) return String(v.text).trim();
+          if (typeof v === 'object' && 'result' in v) return String(v.result).trim();
           return String(v).trim();
         };
-
         const norm = [];
         for (let r = 2; r <= ws.rowCount; r++) {
           const row = ws.getRow(r);
           const napId = cellVal(row, headerMap['NAP ID']);
           if (!napId) continue;
           norm.push({
-            napId:    napId,
+            napId: napId,
             city:     cellVal(row, headerMap['CITY_NAME']),
             brgy:     cellVal(row, headerMap['BRGY_NAME']),
             location: cellVal(row, headerMap['LOCATION TAGGING'])
@@ -645,13 +713,11 @@
         $('#bulkGo').disabled = true;
       }
     });
-
     $('#bulkGo').onclick = async () => {
       if (!bulkPayload) return;
       $('#bulkGo').disabled = true;
       $('#bulkStatus').innerHTML = '⏳ Uploading…';
       try {
-        // Send in chunks of 1000 to stay well under the google.script.run payload limit.
         const CHUNK = 1000;
         let added = 0, updated = 0;
         for (let i = 0; i < bulkPayload.length; i += CHUNK) {
@@ -695,49 +761,98 @@
   }
 
   // ============================================================
-  // ADMINS
+  // USERS (admin)
   // ============================================================
-  function initAdmins() {
-    $('#adminAdd').onclick = async () => {
-      const email = $('#adminEmail').value.trim();
-      if (!email) return;
+  function initUsers() {
+    $('#userAdd').onclick = async () => {
+      const u = $('#newUser').value.trim();
+      const p = $('#newPass').value;
+      const a = $('#newIsAdmin').checked;
+      if (!u || !p) {
+        $('#userAddStatus').innerHTML = '<div class="err">Username and password are required.</div>';
+        return;
+      }
       try {
-        const r = await call('addAdmin', email);
-        const msg = r.action === 'exists'
-          ? `${esc(r.email)} already has access.`
-          : `✅ Access granted to ${esc(r.email)}.`;
-        $('#adminStatus').innerHTML = `<div class="ok">${msg}</div>`;
-        $('#adminEmail').value = '';
-        refreshAdmins();
+        const r = await call('adminCreateUser', u, p, a);
+        $('#userAddStatus').innerHTML = `<div class="ok">✅ Created ${esc(r.username)}.</div>`;
+        $('#newUser').value = ''; $('#newPass').value = ''; $('#newIsAdmin').checked = false;
+        refreshUserList();
       } catch (err) {
-        $('#adminStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
+        $('#userAddStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
       }
     };
-    refreshAdmins();
+    refreshUserList();
   }
 
-  async function refreshAdmins() {
+  async function refreshUserList() {
     try {
-      const list = await call('listAdmins');
-      $('#adminList').innerHTML = list.length
-        ? list.map(a => `<div class="item">
-            <div>
-              <strong>${esc(a.email)}</strong>
-              <div class="meta">added ${esc((a.addedAt || '').slice(0,10))} by ${esc(a.addedBy)}</div>
-            </div>
-            <button class="danger" data-email="${esc(a.email)}">Revoke</button>
-          </div>`).join('')
-        : '<p class="sub">No authorized users yet. Add a row to the ADMINS tab of the lookup sheet to bootstrap.</p>';
-      $$('#adminList button').forEach(b => {
-        b.onclick = async () => {
-          if (!confirm(`Revoke access for ${b.dataset.email}?`)) return;
-          try { await call('removeAdmin', b.dataset.email); refreshAdmins(); }
-          catch (err) { alert(err.message || err); }
-        };
+      const list = await call('adminListUsers');
+      if (!list.length) { $('#userList').innerHTML = '<p class="sub">No users.</p>'; return; }
+      $('#userList').innerHTML = list.map(u => `
+        <div class="item">
+          <div>
+            <strong>${esc(u.username)}</strong> ${u.isAdmin ? '<span class="chip ok">Admin</span>' : '<span class="chip neutral">User</span>'}
+            <div class="meta">created ${esc((u.createdAt || '').slice(0,10))} by ${esc(u.createdBy)}${u.lastLogin ? ' · last login ' + esc(u.lastLogin.slice(0,10)) : ''}</div>
+          </div>
+          <div style="display:flex; gap:6px; flex-wrap:wrap">
+            <button class="ghost" data-act="reset" data-u="${esc(u.username)}">Reset password</button>
+            <button class="ghost" data-act="toggle" data-u="${esc(u.username)}" data-a="${u.isAdmin ? '1' : '0'}">${u.isAdmin ? 'Revoke admin' : 'Grant admin'}</button>
+            <button class="danger" data-act="del" data-u="${esc(u.username)}">Delete</button>
+          </div>
+        </div>`).join('');
+      $$('#userList button').forEach(b => {
+        b.onclick = () => userAction(b.dataset.act, b.dataset.u, b.dataset.a === '1');
       });
     } catch (err) {
-      $('#adminList').innerHTML = `<p class="err">${esc(err.message || err)}</p>`;
+      $('#userList').innerHTML = `<p class="err">${esc(err.message || err)}</p>`;
     }
+  }
+
+  async function userAction(act, username, isAdmin) {
+    try {
+      if (act === 'reset') {
+        const pw = prompt(`Reset password for ${username}. Enter the new password (≥ 8 chars):`);
+        if (!pw) return;
+        await call('adminResetPassword', username, pw);
+        alert(`Password reset for ${username}. They will be signed out and must use the new password.`);
+      } else if (act === 'toggle') {
+        if (!confirm(`${isAdmin ? 'Revoke' : 'Grant'} admin for ${username}?`)) return;
+        await call('adminToggleAdmin', username, !isAdmin);
+      } else if (act === 'del') {
+        if (!confirm(`Delete user ${username}? This cannot be undone.`)) return;
+        await call('adminDeleteUser', username);
+      }
+      refreshUserList();
+    } catch (err) {
+      alert(err.message || err);
+    }
+  }
+
+  // ============================================================
+  // CHANGE MY PASSWORD
+  // ============================================================
+  function initPassword() {
+    $('#pwChange').onclick = async () => {
+      const cur = $('#curPass').value;
+      const np  = $('#newPw').value;
+      const np2 = $('#newPw2').value;
+      if (!cur || !np || !np2) {
+        $('#pwStatus').innerHTML = '<div class="err">All fields are required.</div>'; return;
+      }
+      if (np !== np2) {
+        $('#pwStatus').innerHTML = '<div class="err">New passwords do not match.</div>'; return;
+      }
+      if (np.length < 8) {
+        $('#pwStatus').innerHTML = '<div class="err">New password must be at least 8 characters.</div>'; return;
+      }
+      try {
+        await call('changeMyPassword', cur, np);
+        $('#pwStatus').innerHTML = '<div class="ok">✅ Password changed. Other sessions have been signed out.</div>';
+        $('#curPass').value = $('#newPw').value = $('#newPw2').value = '';
+      } catch (err) {
+        $('#pwStatus').innerHTML = `<div class="err">${esc(err.message || err)}</div>`;
+      }
+    };
   }
 
   // ============================================================
@@ -751,18 +866,20 @@
   // Boot
   // ============================================================
   (async function boot() {
-    try { session = await call('getSession'); }
-    catch (e) { session = { email: '', isAdmin: false }; }
-
-    // Single allowlist: ADMINS tab. Not on it → can't use the app.
-    if (!session.isAdmin) {
-      renderAccessDenied(session.email);
-      return;
-    }
-
-    const initial = (location.hash || '#converter').slice(1);
-    const allowed = PAGES.find(p => p.id === initial);
-    setPage(allowed ? initial : 'converter');
-    window.addEventListener('hashchange', () => render((location.hash || '#converter').slice(1)));
+    const stored = loadStoredSession();
+    if (!stored || !stored.token) { showLogin(); return; }
+    try {
+      const r = await callRaw('ping', stored.token);
+      if (r && r.ok) {
+        session = { token: stored.token, username: r.username, isAdmin: r.isAdmin };
+        mountApp();
+        window.addEventListener('hashchange', () => {
+          if (session) render((location.hash || '#converter').slice(1));
+        });
+        return;
+      }
+    } catch (e) {}
+    clearSession();
+    showLogin();
   })();
 </script>

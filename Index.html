@@ -19,6 +19,7 @@
     <div class="topbar-right">
       <span class="pill"><span class="dot"></span> <span id="todayPill">Today</span></span>
       <span class="pill" id="userPill" style="display:none"></span>
+      <button id="logoutBtn" class="ghost" style="display:none; background:rgba(255,255,255,.08); color:#fff; border:1px solid rgba(255,255,255,.18)">Log out</button>
     </div>
   </header>
 
@@ -37,6 +38,21 @@
     </main>
   </div>
 
+  <!-- ============ LOGIN ============ -->
+  <template id="tpl-login">
+    <div class="card" style="max-width:420px; margin:60px auto">
+      <h2>🔐 Sign in</h2>
+      <p class="sub">Enter your username and password to access the NAP Data Converter.</p>
+      <label class="field"><span>Username</span><input id="loginUser" autocomplete="username"></label>
+      <label class="field" style="margin-top:12px"><span>Password</span><input id="loginPass" type="password" autocomplete="current-password"></label>
+      <div class="actions">
+        <button id="loginGo" class="primary" style="flex:1">Sign in</button>
+      </div>
+      <div class="status" id="loginStatus"></div>
+    </div>
+  </template>
+
+  <!-- ============ CONVERTER ============ -->
   <template id="tpl-converter">
     <div class="card">
       <div class="row">
@@ -73,6 +89,7 @@
     </div>
   </template>
 
+  <!-- ============ GEO REFERENCE ============ -->
   <template id="tpl-geo">
     <div class="tabs">
       <div class="tab-row">
@@ -126,19 +143,48 @@
     </div>
   </template>
 
-  <template id="tpl-admins">
+  <!-- ============ USERS (admin) ============ -->
+  <template id="tpl-users">
     <div class="card">
-      <h2>Authorized users</h2>
-      <p class="sub">Anyone on this list can access the NAP Data Converter (with the Google account whose email is listed). Anyone not on the list sees the Access Required screen. Add a supervisor or teammate's Google email below to grant access.</p>
-      <div class="row">
-        <input id="adminEmail" placeholder="supervisor@company.com" class="search" style="margin:0; flex:1; min-width:240px;">
-        <button class="primary" id="adminAdd">Grant access</button>
+      <h2>Add new user</h2>
+      <p class="sub">Pick a username, set an initial password (≥ 8 chars), and choose whether this user is an admin. Admins can manage users and GEO Reference.</p>
+      <div class="grid2">
+        <label class="field"><span>Username</span><input id="newUser" autocomplete="off"></label>
+        <label class="field"><span>Password</span><input id="newPass" type="password" autocomplete="new-password"></label>
       </div>
-      <div id="adminList" class="list" style="margin-top:16px"></div>
-      <div class="status" id="adminStatus"></div>
+      <label class="field" style="margin-top:10px; flex-direction:row; align-items:center; gap:8px">
+        <input type="checkbox" id="newIsAdmin" style="width:auto">
+        <span style="font-size:13.5px; color:var(--ink-2); text-transform:none; letter-spacing:0; font-weight:500">Grant admin access</span>
+      </label>
+      <div class="actions">
+        <button class="primary" id="userAdd">Create user</button>
+      </div>
+      <div class="status" id="userAddStatus"></div>
+    </div>
+
+    <div class="card">
+      <h2>Existing users</h2>
+      <p class="sub">Reset a user's password, toggle admin, or delete the account. Users are auto-signed-out when their password is reset.</p>
+      <div id="userList" class="list"></div>
     </div>
   </template>
 
+  <!-- ============ CHANGE MY PASSWORD ============ -->
+  <template id="tpl-password">
+    <div class="card" style="max-width:520px">
+      <h2>Change your password</h2>
+      <p class="sub">After changing your password, you'll be signed out from any other browsers / sessions automatically.</p>
+      <label class="field"><span>Current password</span><input id="curPass" type="password" autocomplete="current-password"></label>
+      <label class="field" style="margin-top:12px"><span>New password</span><input id="newPw" type="password" autocomplete="new-password"></label>
+      <label class="field" style="margin-top:12px"><span>Confirm new password</span><input id="newPw2" type="password" autocomplete="new-password"></label>
+      <div class="actions">
+        <button class="primary" id="pwChange">Update password</button>
+      </div>
+      <div class="status" id="pwStatus"></div>
+    </div>
+  </template>
+
+  <!-- ============ ABOUT ============ -->
   <template id="tpl-about">
     <div class="card">
       <h2>About this app</h2>
@@ -148,7 +194,7 @@
       <h3>How it works</h3>
       <ul>
         <li><strong>Browser</strong> streams the CSV, parses + merges + enriches, builds the Excel, triggers download.</li>
-        <li><strong>Apps Script</strong> only stores the GEO_REFERENCE (City / Barangay / Location Tagging by NAP ID) and the admin allowlist.</li>
+        <li><strong>Apps Script</strong> only stores the GEO_REFERENCE, the user accounts, and active sessions.</li>
         <li>PLA ID, Tech, Sales Area, Province, Territory are derived from the same dictionaries the Python script uses (bundled into the page).</li>
       </ul>
       <h3>Notes</h3>
@@ -156,6 +202,7 @@
         <li>Output XLSX size scales with row count. For 700 MB CSV the resulting Excel can be 50–200 MB — make sure you have RAM.</li>
         <li>The browser tab will say "loading" for a while during big conversions. That's normal — don't close it. A progress bar shows live status.</li>
         <li>Conversions are <strong>not saved</strong> anywhere. Re-run if you need the file again.</li>
+        <li>Sessions last 24 hours, then you'll be asked to sign in again.</li>
       </ul>
     </div>
   </template>
